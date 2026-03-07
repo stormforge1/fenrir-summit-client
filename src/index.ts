@@ -302,7 +302,6 @@ function resolveEffectiveHealth(
   beast: BeastHealthContext | null | undefined,
   nowMs = Date.now()
 ): number {
-  const assumeAutoRevive = process.env.FENRIR_ASSUME_AUTO_REVIVE === "1";
   const currentHealth = Number(live?.health ?? 0);
   if (currentHealth > 0) return currentHealth;
 
@@ -312,17 +311,18 @@ function resolveEffectiveHealth(
   const lastDeathTs = Number(live?.last_death_timestamp ?? beast?.last_death_timestamp ?? 0);
   const spirit = Number(live?.spirit ?? beast?.spirit ?? 0);
 
-  // Default to strict on-chain semantics: current_health=0 means dead.
-  // Enable legacy auto-revive inference only when explicitly requested.
+  // Beasts auto-revive after their spirit-based cooldown expires.
+  // The on-chain view functions still report current_health=0 for
+  // auto-revived beasts, so we infer alive status from the cooldown.
   if (currentHealth === 0) {
+    // Never died → treat as alive if beast has health.
     if (lastDeathTs === 0 && fullHealth > 0) {
       return fullHealth;
     }
-    if (assumeAutoRevive) {
-      const revivalReadyAt = lastDeathTs * 1_000 + getBeastRevivalTimeMs(spirit);
-      if (lastDeathTs > 0 && revivalReadyAt <= nowMs && fullHealth > 0) {
-        return fullHealth;
-      }
+    // Died before → check if cooldown expired (auto-revive).
+    const revivalReadyAt = lastDeathTs * 1_000 + getBeastRevivalTimeMs(spirit);
+    if (lastDeathTs > 0 && revivalReadyAt <= nowMs && fullHealth > 0) {
+      return fullHealth;
     }
   }
 
