@@ -878,9 +878,39 @@ async function main() {
         const holderIsOurs = ourBeastsRawWithLive.some(
           (beast) => beast.token_id === holderRaw.token_id
         );
+        // Also skip poison for protected owners (safety belt — main check
+        // already `continue`s above, but this guards against fallback failure).
+        let poisonProtected = false;
+        if (!holderIsOurs && protectedOwners.length > 0) {
+          poisonProtected = [...protectedTokenIdsByOwner.values()].some((ids) =>
+            ids.has(holderRaw.token_id)
+          );
+          if (!poisonProtected) {
+            try {
+              const holderOwner = await chain.getBeastOwner(holderRaw.token_id);
+              if (holderOwner && protectedOwners.includes(holderOwner)) {
+                poisonProtected = true;
+                // Add to cache so future checks are instant
+                for (const [owner, ids] of protectedTokenIdsByOwner) {
+                  if (owner === holderOwner) {
+                    ids.add(holderRaw.token_id);
+                    break;
+                  }
+                }
+              }
+            } catch {
+              // Best effort — skip poison to be safe.
+              poisonProtected = true;
+            }
+          }
+        }
         if (holderIsOurs) {
           logger.debug(
             `[POISON] Skip: holder token=${holderRaw.token_id} belongs to our account`
+          );
+        } else if (poisonProtected) {
+          logger.info(
+            `[PROTECT] Skipping poison for protected holder token=${holderRaw.token_id}`
           );
         } else {
           const extraLives = Number(holderRaw.extra_lives ?? 0);
