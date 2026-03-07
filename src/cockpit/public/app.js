@@ -6,6 +6,12 @@ const els = {
   statSignals: document.getElementById("statSignals"),
   statErrors: document.getElementById("statErrors"),
   statRunnerMode: document.getElementById("statRunnerMode"),
+  contributionCard: document.getElementById("contributionCard"),
+  contributionValue: document.getElementById("contributionValue"),
+  contributionMessage: document.getElementById("contributionMessage"),
+  contributionPercent: document.getElementById("contributionPercent"),
+  contributionProgress: document.getElementById("contributionProgress"),
+  contributionBadge: document.getElementById("contributionBadge"),
   shareCardText: document.getElementById("shareCardText"),
   copyShareBtn: document.getElementById("copyShareBtn"),
   tweetShareBtn: document.getElementById("tweetShareBtn"),
@@ -75,6 +81,7 @@ const DEFAULT_SUMMIT_CONTRACT = "0x01aa95ea66e7e01acf7dc3fda8be0d8661230c4c36b01
 const STARKNET_MAINNET_CHAIN_ID_HEX = "0x534e5f4d41494e";
 const DEFAULT_PROFILE_ID = "runner";
 const ALLIANCE_NAME = "KrüP1k4C0fCh4rH4n0d1 Alliance";
+const ALLIANCE_ATTACK_GOAL = 50;
 const API_BASE_STORAGE_KEY = "fenrir.cockpitApiBaseUrl";
 const AUTO_API_BASE_CANDIDATES = ["", "http://127.0.0.1:8788", "http://localhost:8788"];
 const CONTROLLER_METHODS = [
@@ -146,12 +153,30 @@ function renderBattleStats() {
   setText(els.statErrors, stats.errors);
   setText(els.statRunnerMode, stats.runnerMode);
 
+  const attacks = Math.max(0, Number(stats.actions || 0));
+  const percent = Math.min(100, Math.round((attacks / ALLIANCE_ATTACK_GOAL) * 100));
+  const remaining = Math.max(0, ALLIANCE_ATTACK_GOAL - attacks);
+  setText(els.contributionValue, `${attacks} / ${ALLIANCE_ATTACK_GOAL} attacks`);
+  setText(els.contributionPercent, `${percent}% of alliance goal`);
+  if (els.contributionProgress instanceof HTMLElement) {
+    els.contributionProgress.style.width = `${percent}%`;
+  }
+
+  if (attacks >= ALLIANCE_ATTACK_GOAL) {
+    setText(els.contributionMessage, "Goal complete. I am doing my part for the alliance.");
+    setText(els.contributionBadge, "Goal Reached");
+  } else {
+    setText(els.contributionMessage, `${remaining} attacks to goal. I am doing my part.`);
+    setText(els.contributionBadge, "Energy Flash");
+  }
+
   const profile = state.profileId || "runner";
   const shareText = [
     `${ALLIANCE_NAME} | Battle Snapshot`,
     "Fenrir Summit Client",
     `Profile: ${profile}`,
     `Mode: ${stats.runnerMode}`,
+    `Contribution: ${attacks}/${ALLIANCE_ATTACK_GOAL} attacks`,
     `Actions: ${stats.actions} | Poison: ${stats.poison} | Rewards: ${stats.rewards}`,
     `Signals: ${stats.signals} | Errors: ${stats.errors}`,
     `Last signal: ${stats.lastSignal}`,
@@ -1193,7 +1218,17 @@ async function refreshRunnerStatus() {
   } else {
     els.logOutput.textContent = "No logs yet for this profile.";
   }
+  const previousActions = Number(state.ui.battleStats.actions || 0);
   state.ui.battleStats = summarizeBattleStats(status.logTail || "", Boolean(status.running));
+  if (state.ui.battleStats.actions > previousActions && els.contributionCard instanceof HTMLElement) {
+    els.contributionCard.classList.remove("flash-active");
+    // Force reflow so repeated flashes retrigger on consecutive updates.
+    void els.contributionCard.offsetWidth;
+    els.contributionCard.classList.add("flash-active");
+    window.setTimeout(() => {
+      els.contributionCard?.classList.remove("flash-active");
+    }, 520);
+  }
   renderBattleStats();
   updateSetupProgress();
   updateActionAvailability();
