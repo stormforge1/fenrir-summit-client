@@ -839,14 +839,38 @@ async function main() {
           continue;
         }
 
-        const isProtectedHolder = [...protectedTokenIdsByOwner.values()].some((ids) =>
+        const isProtectedByToken = [...protectedTokenIdsByOwner.values()].some((ids) =>
           ids.has(holderRaw.token_id)
         );
-        if (isProtectedHolder) {
+        if (isProtectedByToken) {
           logger.info(`[PROTECT] Skipping protected summit holder token=${holderRaw.token_id}`);
           await sleep(config.api.pollIntervalMs);
           consecutiveErrors = 0;
           continue;
+        }
+
+        // Fallback: if token isn't in the cached set, check the on-chain owner
+        // directly. This catches beasts missed by pagination or acquired after
+        // the last protected-owner refresh.
+        try {
+          const holderOwner = await chain.getBeastOwner(holderRaw.token_id);
+          if (holderOwner && protectedOwners.includes(holderOwner)) {
+            logger.info(
+              `[PROTECT] Skipping protected summit holder token=${holderRaw.token_id} (owner fallback: ${holderOwner})`
+            );
+            // Add to cache so future checks are instant
+            for (const [owner, ids] of protectedTokenIdsByOwner) {
+              if (owner === holderOwner) {
+                ids.add(holderRaw.token_id);
+                break;
+              }
+            }
+            await sleep(config.api.pollIntervalMs);
+            consecutiveErrors = 0;
+            continue;
+          }
+        } catch {
+          // Best effort — proceed with attack if owner check fails.
         }
       }
 
