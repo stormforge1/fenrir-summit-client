@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 const SECRET_RULES = [
@@ -14,21 +14,10 @@ const SECRET_RULES = [
 ];
 
 const PERSONAL_RULES = [
-  { id: "local-user-path", re: /\/Users\/olifreuler\//gi },
-  { id: "olifreuler", re: /\bolifreuler\b/gi },
-  { id: "stormforge", re: /\bstormforge\b/gi },
-  { id: "monday", re: /\bmonday\b/gi },
-  { id: "salomonday", re: /\bsalomonday\b/gi },
-  { id: "krims", re: /\bkrims\b/gi },
-  { id: "diadem5", re: /\bdiadem5\b/gi },
-  { id: "0d1nf233", re: /\b0d1nf233\b/gi },
-  { id: "wallet-monday", re: /\b0x72b62314442bb89cc5a44181ded7972bfe559f74af9f0699257ca52fb459bfd\b/gi },
-  { id: "wallet-salomonday", re: /\b0x017dc36e56a09b8b4a78b3dc934f216eb97cb0a326944cf5717b328f249cbce4\b/gi },
-  { id: "wallet-krims", re: /\b0x0?6a7f6e0590dcee952d535f15ed89a977323474e438ebd3c6411783392e8e4c8\b/gi },
-  { id: "wallet-diadem5", re: /\b0x077bfe63a1b5bf162a39036b5be856cd4b322846fd6269b841d10fca20b17a59\b/gi },
-  { id: "wallet-0d1nf233", re: /\b0x0?4ac9805537b881adc2b95589f75e1b808c1b7cc59d0f6da80101dea5208b664\b/gi },
+  { id: "local-user-path", re: /\/Users\/[^/\s]+\//g },
 ];
 
+const LOCAL_BLOCKLIST_FILE = ".public-safety-blocklist.txt";
 const ALL_RULES = [...SECRET_RULES, ...PERSONAL_RULES];
 const SKIP_EXTENSIONS = new Set([
   ".png",
@@ -55,6 +44,26 @@ function getTrackedFiles() {
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function escapeRegex(raw) {
+  return raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function addLocalBlocklistRules() {
+  if (!existsSync(LOCAL_BLOCKLIST_FILE)) return;
+
+  const lines = readFileSync(LOCAL_BLOCKLIST_FILE, "utf8")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && !s.startsWith("#"));
+
+  for (const token of lines) {
+    ALL_RULES.push({
+      id: "local-blocklist",
+      re: new RegExp(escapeRegex(token), "gi"),
+    });
+  }
 }
 
 function shouldSkip(file) {
@@ -101,6 +110,7 @@ function scanFile(file) {
 }
 
 function main() {
+  addLocalBlocklistRules();
   const files = getTrackedFiles();
   const findings = files.flatMap(scanFile);
   if (findings.length === 0) {

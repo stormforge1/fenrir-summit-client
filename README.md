@@ -251,5 +251,6 @@ npm run safety:public
 
 2. Ensure private runtime files are not tracked (`config/*.json`, `data/*`, `public-data/*`, sessions, logs).
 3. Never commit personal wallet addresses, usernames, local machine paths, or API keys.
+4. Optional: create `.public-safety-blocklist.txt` (gitignored) with one sensitive token per line; the scanner will block commits containing those tokens.
 
-The pre-commit hook (installed via `npm run hooks:install`) blocks known personal identifiers and common secrets automatically.
+The pre-commit hook (installed via `npm run hooks:install`) blocks common secrets automatically and can enforce your local blocklist.

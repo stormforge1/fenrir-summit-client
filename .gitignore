@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.log
 .env
+.public-safety-blocklist.txt
 
 # Session secrets — NEVER commit
 data/*/cartridge-session/
