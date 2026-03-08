@@ -289,11 +289,10 @@ export class StrategyEngine {
       );
     } else if (this.config.strategy.sendAllBeasts) {
       const maxBeasts = Math.min(this.config.strategy.maxBeastsPerAttack, profile.maxBeasts);
-      // For max-streak questing, keep pressure on the same top streaking beasts
-      // instead of freshness rotation, otherwise progress stalls around mid streak.
-      attackers = streakPriorityActive
-        ? pool.slice(0, maxBeasts)
-        : this.selectDynamicAttackers(pool, maxBeasts, summitHolder.token_id);
+      // Use dynamic rotation even during streak questing: each beast completes
+      // its streak in 1-2 txs (atkCount=9), so momentum isn't a concern.
+      // Broader rotation = more quests completed = more rewards.
+      attackers = this.selectDynamicAttackers(pool, maxBeasts, summitHolder.token_id);
     } else {
       attackers = streakPriorityActive
         ? pool.slice(0, 1)
@@ -733,8 +732,8 @@ export class StrategyEngine {
 
       const aLast = this.beastLastSelectedAt.get(a.token_id) ?? 0;
       const bLast = this.beastLastSelectedAt.get(b.token_id) ?? 0;
-      // Prefer recently used beasts to preserve consecutive streak momentum.
-      if (aLast !== bLast) return bLast - aLast;
+      // Prefer least recently used beasts for broader quest coverage.
+      if (aLast !== bLast) return aLast - bLast;
 
       return b.score - a.score;
     });
