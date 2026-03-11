@@ -638,6 +638,10 @@ async function main() {
     1,
     Math.floor(Number(process.env.FENRIR_ONCHAIN_ALIVE_SINGLE_VERIFY_LIMIT ?? 8))
   );
+  const attackSelectionOnchainProbeLimit = Math.max(
+    24,
+    Math.floor(Number(process.env.FENRIR_ATTACK_SELECTION_ONCHAIN_PROBE_LIMIT ?? 128))
+  );
   const ownerBeastCache: OwnerBeastCacheState = {
     rawWithLive: [],
     enriched: [],
@@ -742,6 +746,139 @@ async function main() {
     );
 
     return ownerBeastCache;
+  };
+
+  const applyLiveStatsToEnrichedBeast = (
+    beast: EnrichedBeast,
+    live: Awaited<ReturnType<ChainClient["getLiveStat"]>>
+  ): EnrichedBeast => {
+    if (!live) return beast;
+    const effectiveHealth = resolveEffectiveHealth(live, beast);
+    return enrichBeast({
+      ...beast,
+      health: effectiveHealth,
+      current_health: effectiveHealth,
+      bonus_health: Number(live.bonus_health ?? beast.bonus_health ?? 0),
+      last_death_timestamp: Number(live.last_death_timestamp ?? beast.last_death_timestamp ?? 0),
+      extra_lives: Number(live.extra_lives ?? beast.extra_lives ?? 0),
+      revival_count: Number(live.revival_count ?? beast.revival_count ?? 0),
+      attack_streak: Number(live.attack_streak ?? beast.attack_streak ?? 0),
+      bonus_xp: Number(live.bonus_xp ?? beast.bonus_xp ?? 0),
+      summit_held_seconds: Number(
+        live.summit_held_seconds ?? beast.summit_held_seconds ?? 0
+      ),
+      rewards_earned: Number(live.rewards_earned ?? beast.rewards_earned ?? 0),
+      rewards_claimed: Number(live.rewards_claimed ?? beast.rewards_claimed ?? 0),
+      quest_captured_summit: Number(
+        live.quest_captured_summit ?? beast.quest_captured_summit ?? 0
+      ),
+      quest_used_revival_potion: Number(
+        live.quest_used_revival_potion ?? beast.quest_used_revival_potion ?? 0
+      ),
+      quest_used_attack_potion: Number(
+        live.quest_used_attack_potion ?? beast.quest_used_attack_potion ?? 0
+      ),
+      quest_max_attack_streak: Number(
+        live.quest_max_attack_streak ?? beast.quest_max_attack_streak ?? 0
+      ),
+      spirit: Number(live.spirit ?? beast.spirit ?? 0),
+    });
+  };
+
+  const buildAliveBiasedAttackSnapshot = async (
+    snapshot: GameSnapshot
+  ): Promise<GameSnapshot> => {
+    if (!useOnchainLiveStats || !snapshot.summitHolder) return snapshot;
+
+    const candidateBeasts = snapshot.ourBeasts.filter(
+      (beast) => beast.token_id !== snapshot.summitHolder?.token_id
+    );
+    if (candidateBeasts.length === 0) return snapshot;
+
+    const scoreFloor = Math.max(0, config.strategy.minScoreToAttack);
+    let ranked = rankBeasts(candidateBeasts, snapshot.summitHolder, {
+      requireTypeAdvantage: config.strategy.requireTypeAdvantage,
+      includeDead: true,
+    }).filter((beast) => beast.score >= scoreFloor);
+
+    if (config.strategy.avoidTypeDisadvantage) {
+      ranked = ranked.filter((beast) => beast.typeAdvantage >= 1);
+    }
+    if (ranked.length === 0) return snapshot;
+
+    const probeCandidates = ranked.slice(0, attackSelectionOnchainProbeLimit);
+    const probeIds = probeCandidates.map((beast) => beast.token_id);
+    if (probeIds.length === 0) return snapshot;
+
+    const updatedById = new Map<number, EnrichedBeast>(
+      snapshot.ourBeasts.map((beast) => [beast.token_id, beast])
+    );
+    const verifiedAliveIds = new Set<number>();
+    const verifiedDeadIds = new Set<number>();
+
+    const classifyWithLive = (
+      tokenId: number,
+      live: Awaited<ReturnType<ChainClient["getLiveStat"]>> | null | undefined
+    ) => {
+      const beast = updatedById.get(tokenId);
+      if (!beast) return;
+      const updated = applyLiveStatsToEnrichedBeast(beast, live ?? null);
+      updatedById.set(tokenId, updated);
+      if (updated.isAlive) verifiedAliveIds.add(tokenId);
+      else verifiedDeadIds.add(tokenId);
+    };
+
+    try {
+      const liveStats = await chain.getLiveStats(probeIds);
+      for (const tokenId of probeIds) {
+        classifyWithLive(tokenId, liveStats.get(tokenId));
+      }
+    } catch (err) {
+      logger.debug(
+        `[L0] Attack preselect batch probe failed: ${decodeHexFelts(serializeError(err)).substring(0, 220)}`
+      );
+      return snapshot;
+    }
+
+    if (verifiedAliveIds.size === 0 && useOnchainSingleAliveVerify) {
+      const verifyIds = probeIds.slice(0, onchainSingleAliveVerifyLimit);
+      for (const tokenId of verifyIds) {
+        try {
+          classifyWithLive(tokenId, await chain.getLiveStat(tokenId));
+        } catch {
+          // Keep batch classification if single-token verify fails.
+        }
+      }
+    }
+
+    const updatedBeasts = snapshot.ourBeasts.map(
+      (beast) => updatedById.get(beast.token_id) ?? beast
+    );
+
+    if (verifiedAliveIds.size === 0) {
+      if (verifiedDeadIds.size > 0) {
+        logger.info(
+          `[L0] Attack preselect found 0 alive across top ${probeCandidates.length} candidates — keeping corrected snapshot for revival fallback`
+        );
+      }
+      return {
+        ...snapshot,
+        ourBeasts: updatedBeasts,
+        timestamp: Date.now(),
+      };
+    }
+
+    const alivePreferredBeasts = updatedBeasts.filter((beast) =>
+      verifiedAliveIds.has(beast.token_id)
+    );
+    logger.info(
+      `[L0] Attack preselect confirmed ${alivePreferredBeasts.length}/${probeCandidates.length} alive candidates on-chain`
+    );
+    return {
+      ...snapshot,
+      ourBeasts: alivePreferredBeasts,
+      timestamp: Date.now(),
+    };
   };
 
   while (true) {
@@ -1224,7 +1361,8 @@ async function main() {
         }
       }
 
-      const action = engine.decide(snapshot);
+      const attackSnapshot = await buildAliveBiasedAttackSnapshot(snapshot);
+      const action = engine.decide(attackSnapshot);
 
       if (action.type === "wait") {
         logger.debug(`Wait: ${action.reason}`);
@@ -1249,7 +1387,7 @@ async function main() {
       if (action.type === "attack" && action.payload && action.beasts) {
         await executeAttackWithRetry(
           action,
-          snapshot,
+          attackSnapshot,
           api,
           chain,
           getOwnerBeastsCached,
