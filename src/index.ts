@@ -25,10 +25,10 @@ import { SummitApiClient } from "./api/client.js";
 import { SummitWsClient } from "./api/ws.js";
 import { ChainClient } from "./chain/client.js";
 import { StrategyEngine } from "./strategy/engine.js";
-import { enrichBeast } from "./strategy/scoring.js";
+import { enrichBeast, rankBeasts } from "./strategy/scoring.js";
 import { Logger } from "./utils/logger.js";
 import { sleep } from "./utils/time.js";
-import type { EnrichedBeast, GameSnapshot } from "./strategy/types.js";
+import type { EnrichedBeast, GameSnapshot, ScoredBeast } from "./strategy/types.js";
 import { VoyagerClient } from "./api/voyager.js";
 import type { ApiBeast } from "./api/types.js";
 
@@ -928,7 +928,13 @@ async function main() {
         }
       }
 
-      if (holderRaw && config.strategy.usePoisonOnHighExtraLives) {
+      const poisonMinHolderPower = Math.max(
+        0,
+        Math.floor(Number(config.strategy.poisonMinHolderPower ?? 0))
+      );
+      const poisonEnabled =
+        config.strategy.usePoisonOnHighExtraLives || poisonMinHolderPower > 0;
+      if (holderRaw && poisonEnabled) {
         const holderIsOurs = ourBeastsRawWithLive.some(
           (beast) => beast.token_id === holderRaw.token_id
         );
@@ -943,38 +949,97 @@ async function main() {
           );
         } else {
           const extraLives = Number(holderRaw.extra_lives ?? 0);
-          const threshold = Math.max(0, config.strategy.poisonHolderExtraLivesThreshold);
-          if (extraLives > 0 && extraLives >= threshold) {
+          const holderPower = Math.max(
+            0,
+            Math.floor(Number(snapshot.summitHolder?.basePower ?? 0))
+          );
+          const extraLifeThreshold = Math.max(
+            0,
+            Math.floor(config.strategy.poisonHolderExtraLivesThreshold)
+          );
+          const shouldPoisonForExtraLives =
+            config.strategy.usePoisonOnHighExtraLives &&
+            extraLives > 0 &&
+            extraLives >= extraLifeThreshold;
+          const shouldPoisonForPower =
+            poisonMinHolderPower > 0 && holderPower > poisonMinHolderPower;
+          if (shouldPoisonForExtraLives || shouldPoisonForPower) {
             const holderId = holderRaw.token_id;
             const now = Date.now();
             const cooldownMs = Math.max(1_000, config.strategy.poisonCooldownMs);
             const lastPoisonAt = lastPoisonAtByHolder.get(holderId) ?? 0;
             if (now - lastPoisonAt >= cooldownMs) {
-              const poisonCount = Math.max(
+              const requestedPoisonCount = Math.max(
                 1,
                 Math.floor(config.strategy.poisonCountPerCast)
               );
-              try {
-                const result = await chain.applyPoison(holderId, poisonCount);
-                lastPoisonAtByHolder.set(holderId, now);
+              const poisonMaxTotalPerBeast = Math.max(
+                1,
+                Math.floor(Number(config.strategy.poisonMaxTotalPerBeast ?? 100_000))
+              );
+              let currentPoison = Math.max(
+                0,
+                Math.floor(
+                  Number((holderRaw as any).poison_count ?? (holderRaw as any).poison ?? 0)
+                )
+              );
+              const poisonCache = poisonSpikeCacheByHolder.get(holderId);
+              if (!poisonCache || now - poisonCache.checkedAt >= defendPoisonProbeCacheMs) {
+                try {
+                  const recentPoisonApplied = voyager
+                    ? await voyager.getRecentPoisonForBeast(holderId)
+                    : await chain.getRecentPoisonAppliedCountForBeast(
+                        holderId,
+                        defendPoisonLookbackBlocks
+                      );
+                  poisonSpikeCacheByHolder.set(holderId, {
+                    checkedAt: now,
+                    latestPoison: recentPoisonApplied,
+                  });
+                  currentPoison = Math.max(currentPoison, Math.max(0, recentPoisonApplied));
+                } catch (poisonProbeErr) {
+                  logger.debug(
+                    `[POISON] Poison probe failed token=${holderId}: ${decodeHexFelts(serializeError(poisonProbeErr)).substring(0, 220)}`
+                  );
+                }
+              } else {
+                currentPoison = Math.max(currentPoison, Math.max(0, poisonCache.latestPoison));
+              }
+              const remainingPoisonRoom = Math.max(0, poisonMaxTotalPerBeast - currentPoison);
+              if (remainingPoisonRoom <= 0) {
                 logger.info(
-                  `[POISON] Applied poison to holder token=${holderId} extraLives=${extraLives} count=${poisonCount} tx=${result.txHash}`
+                  `[POISON] Skip holder token=${holderId}: currentPoison=${currentPoison} reached cap=${poisonMaxTotalPerBeast}`
                 );
-                logger.event("poison_applied", {
-                  tokenId: holderId,
-                  extraLives,
-                  count: poisonCount,
-                  multiplier: 1,
-                  txHash: result.txHash,
-                });
-              } catch (poisonErr) {
-                const poisonMsg = decodeHexFelts(serializeError(poisonErr));
-                logger.warn(
-                  `[POISON] Failed for holder token=${holderId} extraLives=${extraLives}: ${poisonMsg.substring(0, 300)}`
-                );
-                const retryMs = Math.max(1_000, Math.min(5_000, Math.floor(cooldownMs / 4)));
-                // Retry failed poison sooner instead of waiting the full poison cooldown.
-                lastPoisonAtByHolder.set(holderId, now - cooldownMs + retryMs);
+                lastPoisonAtByHolder.set(holderId, now);
+              } else {
+                const poisonCount = Math.min(requestedPoisonCount, remainingPoisonRoom);
+                try {
+                  const result = await chain.applyPoison(holderId, poisonCount);
+                  lastPoisonAtByHolder.set(holderId, now);
+                  poisonSpikeCacheByHolder.set(holderId, {
+                    checkedAt: now,
+                    latestPoison: currentPoison + poisonCount,
+                  });
+                  logger.info(
+                    `[POISON] Applied poison to holder token=${holderId} power=${holderPower} extraLives=${extraLives} count=${poisonCount} totalPoison=${currentPoison + poisonCount}/${poisonMaxTotalPerBeast} tx=${result.txHash}`
+                  );
+                  logger.event("poison_applied", {
+                    tokenId: holderId,
+                    holderPower,
+                    extraLives,
+                    count: poisonCount,
+                    multiplier: 1,
+                    txHash: result.txHash,
+                  });
+                } catch (poisonErr) {
+                  const poisonMsg = decodeHexFelts(serializeError(poisonErr));
+                  logger.warn(
+                    `[POISON] Failed for holder token=${holderId} power=${holderPower} extraLives=${extraLives}: ${poisonMsg.substring(0, 300)}`
+                  );
+                  const retryMs = Math.max(1_000, Math.min(5_000, Math.floor(cooldownMs / 4)));
+                  // Retry failed poison sooner instead of waiting the full poison cooldown.
+                  lastPoisonAtByHolder.set(holderId, now - cooldownMs + retryMs);
+                }
               }
             }
           }
@@ -1245,6 +1310,7 @@ async function executeAttackWithRetry(
     HARD_MAX_REVIVAL_POTIONS_PER_BEAST,
     Math.max(0, Math.floor(config.strategy.maxRevivalPotionsPerBeast))
   );
+  const effectiveMaxRevivalPotionsPerBeast = maxRevivalPotionsPerBeast;
   const revivalEnabledByConfig = config.strategy.useRevivalPotions;
   const requireAttackPotions =
     config.strategy.useAttackPotions && process.env.FENRIR_REQUIRE_ATTACK_POTIONS !== "0";
@@ -1277,6 +1343,22 @@ async function executeAttackWithRetry(
   let lastForcedRevivalGateRefreshAt = 0;
   let lastOnchainAliveProbeAt = 0;
   let lastOnchainAliveCount: number | null = null;
+  const SELECTION_SINGLE_VERIFY_LIMIT = Math.max(
+    4,
+    Math.floor(Number(process.env.FENRIR_SELECTION_SINGLE_VERIFY_LIMIT ?? 12))
+  );
+  const SELECTION_ALIVE_HINT_MS = Math.max(
+    1_000,
+    Math.floor(Number(process.env.FENRIR_SELECTION_ALIVE_HINT_MS ?? 5_000))
+  );
+  const SELECTION_DEAD_HINT_MS = Math.max(
+    60_000,
+    Math.floor(Number(process.env.FENRIR_SELECTION_DEAD_HINT_MS ?? 900_000))
+  );
+  const selectionHealthHintsByToken = new Map<
+    number,
+    { effectiveHealth: number; expiresAt: number }
+  >();
   const ONCHAIN_ALIVE_PROBE_CACHE_MS = Math.max(
     500,
     Math.floor(Number(process.env.FENRIR_ONCHAIN_ALIVE_PROBE_CACHE_MS ?? 2_500))
@@ -1303,6 +1385,90 @@ async function executeAttackWithRetry(
       if (expiry <= nowMs) beastCooldownExclusions.delete(tokenId);
     }
   };
+  const sweepExpiredSelectionHealthHints = () => {
+    const nowMs = Date.now();
+    for (const [tokenId, hint] of selectionHealthHintsByToken) {
+      if (hint.expiresAt <= nowMs) selectionHealthHintsByToken.delete(tokenId);
+    }
+  };
+  const getSelectionHealthHint = (tokenId: number) => {
+    sweepExpiredSelectionHealthHints();
+    return selectionHealthHintsByToken.get(tokenId) ?? null;
+  };
+  const getSelectionHealthHintExpiry = (
+    beast: Pick<EnrichedBeast, "last_death_timestamp" | "spirit">,
+    effectiveHealth: number,
+    nowMs = Date.now()
+  ): number => {
+    if (effectiveHealth > 0) {
+      return nowMs + SELECTION_ALIVE_HINT_MS;
+    }
+    const fallbackExpiry = nowMs + SELECTION_DEAD_HINT_MS;
+    const lastDeathTs = Math.max(0, Number(beast.last_death_timestamp ?? 0));
+    if (lastDeathTs <= 0) {
+      return fallbackExpiry;
+    }
+    const revivalReadyAt = lastDeathTs * 1_000 + getBeastRevivalTimeMs(Number(beast.spirit ?? 0));
+    return Math.max(nowMs + 60_000, Math.min(fallbackExpiry, revivalReadyAt));
+  };
+  const setSelectionHealthHint = (
+    beast: EnrichedBeast,
+    effectiveHealth: number,
+    nowMs = Date.now()
+  ) => {
+    selectionHealthHintsByToken.set(beast.token_id, {
+      effectiveHealth,
+      expiresAt: getSelectionHealthHintExpiry(beast, effectiveHealth, nowMs),
+    });
+  };
+  const resolveSelectionEffectiveHealth = (
+    tokenId: number,
+    live: LiveHealthContext | null | undefined,
+    beast: BeastHealthContext | null | undefined,
+    nowMs = Date.now()
+  ): number => {
+    const hint = getSelectionHealthHint(tokenId);
+    if (hint) {
+      return hint.effectiveHealth;
+    }
+    const currentHealth = Number(live?.health ?? 0);
+    if (currentHealth > 0) return currentHealth;
+
+    const snapshotHealth = Math.max(
+      0,
+      Number(beast?.current_health ?? beast?.health ?? 0)
+    );
+    const bonusHealth = Number(live?.bonus_health ?? beast?.bonus_health ?? 0);
+    const fullHealth = Math.max(0, snapshotHealth + bonusHealth);
+    const lastDeathTs = Number(live?.last_death_timestamp ?? beast?.last_death_timestamp ?? 0);
+    const spirit = Number(live?.spirit ?? beast?.spirit ?? 0);
+
+    // For tx-validity checks, treat zero-health + missing death timestamp as dead/unknown.
+    // Only infer auto-revive when the contract exposes an actual death timestamp and the
+    // cooldown has elapsed.
+    if (currentHealth === 0 && lastDeathTs > 0 && fullHealth > 0) {
+      const revivalReadyAt = lastDeathTs * 1_000 + getBeastRevivalTimeMs(spirit);
+      if (revivalReadyAt <= nowMs) {
+        return fullHealth;
+      }
+    }
+
+    if (!live) {
+      return snapshotHealth;
+    }
+    return 0;
+  };
+  const applySelectionHealthHints = (beasts: EnrichedBeast[]): EnrichedBeast[] =>
+    beasts.map((beast) => {
+      const hint = getSelectionHealthHint(beast.token_id);
+      if (!hint) return beast;
+      return enrichBeast({
+        ...beast,
+        health: hint.effectiveHealth,
+        current_health: hint.effectiveHealth,
+      });
+    });
+  
   const clearFocusedRetryToken = (tokenId?: number) => {
     if (tokenId === undefined || focusedRetryTokenId === tokenId) {
       focusedRetryTokenId = null;
@@ -1337,6 +1503,164 @@ async function executeAttackWithRetry(
   ) > 0;
   const beastNeedsStreakQuest = (beast: { quest_max_attack_streak?: number | null }): boolean =>
     streakTargetEnabled && Number(beast.quest_max_attack_streak ?? 0) !== 1;
+  const getSelectionProbeCandidates = (
+    beasts: EnrichedBeast[],
+    priorityTokenIds: number[] = []
+  ): EnrichedBeast[] => {
+    const hintedBeasts = applySelectionHealthHints(beasts);
+    const aliveCandidates = hintedBeasts.filter(
+      (beast) =>
+        beast.isAlive &&
+        !excludedTokenIds.has(beast.token_id) &&
+        !beastCooldownExclusions.has(beast.token_id) &&
+        !isCurrentHolderToken(beast.token_id)
+    );
+    if (aliveCandidates.length === 0) {
+      return [];
+    }
+
+    const byId = new Map<number, EnrichedBeast>(
+      aliveCandidates.map((beast) => [beast.token_id, beast])
+    );
+    const ordered: EnrichedBeast[] = [];
+    const seen = new Set<number>();
+    const pushCandidate = (beast: EnrichedBeast | undefined) => {
+      if (!beast || seen.has(beast.token_id)) return;
+      seen.add(beast.token_id);
+      ordered.push(beast);
+    };
+
+    for (const tokenId of priorityTokenIds) {
+      pushCandidate(byId.get(tokenId));
+    }
+
+    const levelTarget = Math.max(
+      0,
+      Math.min(10, config.strategy.growingStrongerTargetLevels)
+    );
+    const sortRankedCandidates = <T extends EnrichedBeast & { score: number }>(ranked: T[]) =>
+      ranked.sort((a, b) => {
+        const aNeedsStreak = beastNeedsStreakQuest(a) ? 1 : 0;
+        const bNeedsStreak = beastNeedsStreakQuest(b) ? 1 : 0;
+        if (aNeedsStreak !== bNeedsStreak) return bNeedsStreak - aNeedsStreak;
+
+        const aBonusLevels = getBonusLevels(Number(a.level ?? 1), Number(a.bonus_xp ?? 0));
+        const bBonusLevels = getBonusLevels(Number(b.level ?? 1), Number(b.bonus_xp ?? 0));
+        const aNeedsLevel = levelTarget > 0 && aBonusLevels < levelTarget ? 1 : 0;
+        const bNeedsLevel = levelTarget > 0 && bBonusLevels < levelTarget ? 1 : 0;
+        if (aNeedsLevel !== bNeedsLevel) return bNeedsLevel - aNeedsLevel;
+
+        if (aNeedsStreak && a.attack_streak !== b.attack_streak) {
+          return Number(a.attack_streak ?? 0) - Number(b.attack_streak ?? 0);
+        }
+        if (aNeedsLevel && aBonusLevels !== bBonusLevels) {
+          return aBonusLevels - bBonusLevels;
+        }
+        if (b.score !== a.score) return b.score - a.score;
+        if (b.basePower !== a.basePower) return b.basePower - a.basePower;
+        return a.token_id - b.token_id;
+      });
+
+    if (currentSnapshot.summitHolder) {
+      let ranked = rankBeasts(aliveCandidates, currentSnapshot.summitHolder, {
+        requireTypeAdvantage: config.strategy.requireTypeAdvantage,
+      });
+      const scoreFloor = Math.max(0, config.strategy.minScoreToAttack);
+      ranked = ranked.filter((beast) => beast.score >= scoreFloor);
+      if (config.strategy.avoidTypeDisadvantage) {
+        ranked = ranked.filter((beast) => beast.typeAdvantage >= 1);
+      }
+      const prioritized = ranked.length > 0
+        ? sortRankedCandidates(ranked)
+        : [...aliveCandidates].sort(
+            (a, b) => b.basePower - a.basePower || a.token_id - b.token_id
+          );
+      for (const beast of prioritized) {
+        pushCandidate(beast);
+      }
+    } else {
+      const prioritized = [...aliveCandidates].sort(
+        (a, b) => b.basePower - a.basePower || a.token_id - b.token_id
+      );
+      for (const beast of prioritized) {
+        pushCandidate(beast);
+      }
+    }
+
+    return ordered;
+  };
+  const primeSelectionHealthHints = async (
+    priorityTokenIds: number[] = [],
+    options?: { forcePriority?: boolean }
+  ): Promise<void> => {
+    sweepExpiredSelectionHealthHints();
+    currentSnapshot = {
+      ...currentSnapshot,
+      ourBeasts: applySelectionHealthHints(currentSnapshot.ourBeasts),
+      timestamp: Date.now(),
+    };
+
+    const forcePriority = options?.forcePriority === true;
+    const forcedIds = forcePriority
+      ? new Set(
+          priorityTokenIds
+            .map((tokenId) => Math.floor(Number(tokenId)))
+            .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0)
+        )
+      : null;
+    const maxVerifyCount = forcePriority
+      ? Math.max(SELECTION_SINGLE_VERIFY_LIMIT, forcedIds?.size ?? 0)
+      : SELECTION_SINGLE_VERIFY_LIMIT;
+    const candidatesToVerify = getSelectionProbeCandidates(
+      currentSnapshot.ourBeasts,
+      priorityTokenIds
+    )
+      .filter(
+        (beast) =>
+          forcedIds?.has(beast.token_id) === true || !getSelectionHealthHint(beast.token_id)
+      )
+      .slice(0, maxVerifyCount);
+    if (candidatesToVerify.length === 0) {
+      return;
+    }
+
+    const results = await Promise.all(
+      candidatesToVerify.map(async (beast) => {
+        try {
+          const live = await chain.getLiveStat(beast.token_id);
+          return {
+            beast,
+            effectiveHealth: resolveSelectionEffectiveHealth(beast.token_id, live, beast),
+          };
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    const nowMs = Date.now();
+    let newlyDead = 0;
+    let newlyAlive = 0;
+    for (const result of results) {
+      if (!result) continue;
+      const { beast, effectiveHealth } = result;
+      if (beast.isAlive && effectiveHealth <= 0) newlyDead += 1;
+      if (!beast.isAlive && effectiveHealth > 0) newlyAlive += 1;
+      setSelectionHealthHint(beast, effectiveHealth, nowMs);
+    }
+
+    currentSnapshot = {
+      ...currentSnapshot,
+      ourBeasts: applySelectionHealthHints(currentSnapshot.ourBeasts),
+      timestamp: Date.now(),
+    };
+
+    if (newlyDead > 0 || newlyAlive > 0) {
+      logger.info(
+        `[L0] Selection single-verify updated ${newlyDead} dead / ${newlyAlive} alive across top ${candidatesToVerify.length} candidates`
+      );
+    }
+  };
   const excludeStaleDeadBeasts = (
     beastsToExclude: Array<{ token_id: number }>,
     cooldownMs: number
@@ -1355,7 +1679,7 @@ async function executeAttackWithRetry(
     }
   };
   const getAliveCandidateCount = (beasts: EnrichedBeast[] = currentSnapshot.ourBeasts): number =>
-    beasts.filter(
+    applySelectionHealthHints(beasts).filter(
       (beast) =>
         beast.isAlive &&
         !excludedTokenIds.has(beast.token_id) &&
@@ -1365,9 +1689,10 @@ async function executeAttackWithRetry(
   const getAliveCandidateTokenIds = (
     beasts: EnrichedBeast[] = currentSnapshot.ourBeasts
   ): number[] => {
+    const hintedBeasts = applySelectionHealthHints(beasts);
     const aliveIds: number[] = [];
     const deadIds: number[] = [];
-    for (const beast of beasts) {
+    for (const beast of hintedBeasts) {
       if (
         excludedTokenIds.has(beast.token_id) ||
         beastCooldownExclusions.has(beast.token_id) ||
@@ -1409,13 +1734,13 @@ async function executeAttackWithRetry(
       const probeIds = tokenIds.slice(0, maxProbeIds);
       const live = await chain.getLiveStats(probeIds);
       const beastByToken = new Map<number, EnrichedBeast>(
-        beasts.map((beast) => [beast.token_id, beast])
+        applySelectionHealthHints(beasts).map((beast) => [beast.token_id, beast])
       );
       let alive = 0;
       for (const tokenId of probeIds) {
         const stats = live.get(tokenId);
         const beast = beastByToken.get(tokenId);
-        if (resolveEffectiveHealth(stats, beast) > 0) {
+        if (resolveSelectionEffectiveHealth(tokenId, stats, beast) > 0) {
           alive += 1;
         }
       }
@@ -1426,7 +1751,7 @@ async function executeAttackWithRetry(
           try {
             const stat = await chain.getLiveStat(tokenId);
             const beast = beastByToken.get(tokenId);
-            if (resolveEffectiveHealth(stat, beast) > 0) singleAlive += 1;
+            if (resolveSelectionEffectiveHealth(tokenId, stat, beast) > 0) singleAlive += 1;
           } catch {
             // Keep batch result if single-token verify fails.
           }
@@ -1487,7 +1812,7 @@ async function executeAttackWithRetry(
     }
     currentSnapshot = {
       ...currentSnapshot,
-      ourBeasts: refreshedBeasts,
+      ourBeasts: applySelectionHealthHints(refreshedBeasts),
       timestamp: Date.now(),
     };
     return refreshedBeasts;
@@ -1531,20 +1856,16 @@ async function executeAttackWithRetry(
     return { allowed: aliveCount === 0, aliveCount };
   };
 
-  // Track consecutive revival fast-excludes within one executeAttack call.
-  // When daily-death resets all beasts at once, discovering them one-by-one
-  // burns 1 failed RPC call per beast. After REVIVAL_FAST_EXCLUDE_BAIL_THRESHOLD
-  // consecutive revival errors, switch ALL remaining batch beasts to revival
-  // mode instead of testing them individually (which wastes 1 RPC per beast).
-  const REVIVAL_FAST_EXCLUDE_BAIL_THRESHOLD = 3;
-  let consecutiveRevivalFastExcludes = 0;
-  let lastBatchBeastIds: number[] = [];
-  const discoveredRevivalNeeds = new Map<number, number>(); // beastId → needed potions
-
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let sentAttackPotionsThisAttempt = 0;
     let sentExtraLifePotionsThisAttempt = 0;
     let sentRevivalPotionsThisAttempt = 0;
+    const attemptPriorityTokenIds =
+      attempt === 1
+        ? (action.beasts ?? []).map((beast) => beast.token_id)
+        : [];
+
+    await primeSelectionHealthHints(attemptPriorityTokenIds);
 
     if (focusedRetryTokenId !== null && !forceRevivalWhileAlive) {
       const aliveAlternatives = await getAliveCandidateCountOnchain() > 0;
@@ -1559,14 +1880,14 @@ async function executeAttackWithRetry(
     // Re-decide with current snapshot (excluding dead/failed beasts).
     // When a revival mismatch identifies a specific beast, pin retries to that
     // beast so we can converge on the exact potion budget instead of rotating.
-    let filteredBeasts = currentSnapshot.ourBeasts.filter(
+    let filteredBeasts = applySelectionHealthHints(currentSnapshot.ourBeasts).filter(
       (b) =>
         !excludedTokenIds.has(b.token_id) &&
         (focusedRetryTokenId === null || b.token_id === focusedRetryTokenId)
     );
     if (focusedRetryTokenId !== null && filteredBeasts.length === 0) {
       clearFocusedRetryToken();
-      filteredBeasts = currentSnapshot.ourBeasts.filter(
+      filteredBeasts = applySelectionHealthHints(currentSnapshot.ourBeasts).filter(
         (b) => !excludedTokenIds.has(b.token_id)
       );
     }
@@ -1592,6 +1913,17 @@ async function executeAttackWithRetry(
       logger.info(`Retry ${attempt}: engine says wait — ${freshAction.reason}`);
       return;
     }
+    function assertAttackAction(
+      value: typeof freshAction
+    ): asserts value is typeof freshAction & {
+      payload: Record<string, unknown>;
+      beasts: ScoredBeast[];
+    } {
+      if (!value.payload || !value.beasts) {
+        throw new Error("Attack action missing payload or beasts");
+      }
+    }
+    assertAttackAction(freshAction);
     const freshPayload = freshAction.payload as Record<string, unknown>;
     const forcedRevivalModeForAction = Boolean(freshPayload.forceRevivalMode);
     const getPayloadAttackTuples = (): Array<[number, number, number]> =>
@@ -1619,6 +1951,35 @@ async function executeAttackWithRetry(
       }
       return Math.max(0, before - freshAction.beasts.length);
     };
+    await primeSelectionHealthHints(
+      freshAction.beasts.map((beast) => beast.token_id),
+      { forcePriority: true }
+    );
+    const hintedBeastsByToken = new Map<number, EnrichedBeast>(
+      currentSnapshot.ourBeasts.map((beast) => [beast.token_id, beast])
+    );
+    freshAction.beasts = freshAction.beasts.map(
+      (beast) => {
+        const hinted = hintedBeastsByToken.get(beast.token_id);
+        return hinted ? { ...beast, ...hinted } : beast;
+      }
+    );
+    const hintedDeadIds = new Set(
+      freshAction.beasts
+        .filter((beast) => !beast.isAlive)
+        .map((beast) => beast.token_id)
+    );
+    if (hintedDeadIds.size > 0) {
+      const pruned = pruneActionAttackersByToken(hintedDeadIds);
+      if (pruned > 0) {
+        logger.info(
+          `[L0] Selection single-verify pruned ${pruned} stale-dead attackers before submit`
+        );
+        if ((freshAction.beasts?.length ?? 0) === 0) {
+          continue;
+        }
+      }
+    }
     if (attempt === 1) {
       const aliveBelow = Number(freshPayload.streakAuditAliveBelowTarget ?? -1);
       const deadBelow = Number(freshPayload.streakAuditDeadBelowTarget ?? -1);
@@ -1635,10 +1996,12 @@ async function executeAttackWithRetry(
         !beastCooldownExclusions.has(b.token_id) &&
         !isCurrentHolderToken(b.token_id)
     );
+    const hasPendingRevivalBudget = requiredRevivalPotions.size > 0;
     let revivalModeForAttempt =
       revivalEnabledByConfig &&
       (forcedRevivalModeForAction ||
         forceRevivalWhileAlive ||
+        hasPendingRevivalBudget ||
         (activeSnapshotBeasts.length > 0 && activeSnapshotBeasts.every((b) => !b.isAlive)));
     let liveStatsForAttempt: Awaited<ReturnType<ChainClient["getLiveStats"]>> | null = null;
 
@@ -1659,7 +2022,8 @@ async function executeAttackWithRetry(
         preferApiHealthMode &&
         revivalModeForAttempt &&
         !forcedRevivalModeForAction &&
-        !forceRevivalWhileAlive
+        !forceRevivalWhileAlive &&
+        !hasPendingRevivalBudget
       ) {
         revivalModeForAttempt = false;
         clearRevivalFocus();
@@ -1685,13 +2049,13 @@ async function executeAttackWithRetry(
         }
       }
 
-      if (!revivalModeForAttempt && freshAction.beasts.length > 0) {
+      if (!preferApiHealth && !revivalModeForAttempt && freshAction.beasts.length > 0) {
         try {
           const live = await chain.getLiveStats(freshAction.beasts.map((b) => b.token_id));
           liveStatsForAttempt = live;
             let staleDead = freshAction.beasts.filter((b) => {
               const stats = live.get(b.token_id);
-              return resolveEffectiveHealth(stats, b) <= 0;
+              return resolveSelectionEffectiveHealth(b.token_id, stats, b) <= 0;
             });
             if (preferApiHealthMode && staleDead.length > 0) {
               logger.warn(
@@ -1743,7 +2107,7 @@ async function executeAttackWithRetry(
                     Number(liveState?.revival_count ?? beast.revival_count ?? 0),
                     attackCountForBeast
                   );
-                  if (required > maxRevivalPotionsPerBeast) {
+                  if (required > effectiveMaxRevivalPotionsPerBeast) {
                     excludeOverCapRevivalBeast(
                       beast.token_id,
                       required,
@@ -1755,7 +2119,7 @@ async function executeAttackWithRetry(
                 });
                 if (eligibleDeadBelowStreak.length === 0) {
                   logger.info(
-                    `[L0] All dead streak candidates exceed revival cap ${maxRevivalPotionsPerBeast} — rotating attackers`
+                    `[L0] All dead streak candidates exceed revival cap ${effectiveMaxRevivalPotionsPerBeast} — rotating attackers`
                   );
                   continue;
                 }
@@ -1763,7 +2127,7 @@ async function executeAttackWithRetry(
                 const focusId = focusCandidate.token_id;
                 const attackCountForFocus = getPayloadAttackCountForToken(focusId);
                 const estimatedRequired = Math.min(
-                  maxRevivalPotionsPerBeast,
+                  effectiveMaxRevivalPotionsPerBeast,
                   estimateDeadBeastRevivalBudget(
                     Number(live.get(focusId)?.revival_count ?? focusCandidate.revival_count ?? 0),
                     attackCountForFocus
@@ -1774,7 +2138,7 @@ async function executeAttackWithRetry(
                   Number(requiredRevivalPotions.get(focusId) ?? 0)
                 );
                 const focusRequired = Math.min(
-                  maxRevivalPotionsPerBeast,
+                  effectiveMaxRevivalPotionsPerBeast,
                   Math.max(estimatedRequired, knownRequired)
                 );
                 requiredRevivalPotions.set(focusId, focusRequired);
@@ -1835,7 +2199,7 @@ async function executeAttackWithRetry(
                   Number(liveState?.revival_count ?? beast.revival_count ?? 0),
                   attackCountForBeast
                 );
-                if (required > maxRevivalPotionsPerBeast) {
+                if (required > effectiveMaxRevivalPotionsPerBeast) {
                   excludeOverCapRevivalBeast(
                     beast.token_id,
                     required,
@@ -1847,7 +2211,7 @@ async function executeAttackWithRetry(
               });
               if (eligibleStaleDead.length === 0) {
                 logger.info(
-                  `[L0] All selected dead attackers exceed revival cap ${maxRevivalPotionsPerBeast} — rotating attackers`
+                  `[L0] All selected dead attackers exceed revival cap ${effectiveMaxRevivalPotionsPerBeast} — rotating attackers`
                 );
                 clearRevivalFocus();
                 continue;
@@ -1856,7 +2220,7 @@ async function executeAttackWithRetry(
               const focusId = focusCandidate.token_id;
               const attackCountForFocus = getPayloadAttackCountForToken(focusId);
               const estimatedRequired = Math.min(
-                maxRevivalPotionsPerBeast,
+                effectiveMaxRevivalPotionsPerBeast,
                 estimateDeadBeastRevivalBudget(
                   Number(
                     live.get(focusId)?.revival_count ?? focusCandidate.revival_count ?? 0
@@ -1869,7 +2233,7 @@ async function executeAttackWithRetry(
                 Number(requiredRevivalPotions.get(focusId) ?? 0)
               );
               const focusRequired = Math.min(
-                maxRevivalPotionsPerBeast,
+                effectiveMaxRevivalPotionsPerBeast,
                 Math.max(estimatedRequired, knownRequired)
               );
               if (focusedRetryTokenId !== focusId) {
@@ -1930,7 +2294,7 @@ async function executeAttackWithRetry(
           if (liveStatsForAttempt) {
             let deadAtSubmit = freshAction.beasts.filter((beast) => {
               const stats = liveStatsForAttempt?.get(beast.token_id);
-              return resolveEffectiveHealth(stats, beast) <= 0;
+              return resolveSelectionEffectiveHealth(beast.token_id, stats, beast) <= 0;
             });
             if (deadAtSubmit.length > 0 && ONCHAIN_ALIVE_SINGLE_VERIFY_ENABLED) {
               let recoveredAlive = 0;
@@ -1940,7 +2304,7 @@ async function executeAttackWithRetry(
                   if (single) {
                     liveStatsForAttempt.set(beast.token_id, single);
                   }
-                  if (resolveEffectiveHealth(single, beast) > 0) {
+                  if (resolveSelectionEffectiveHealth(beast.token_id, single, beast) > 0) {
                     recoveredAlive += 1;
                   }
                 } catch {
@@ -1951,7 +2315,7 @@ async function executeAttackWithRetry(
                 const initialDeadCount = deadAtSubmit.length;
                 deadAtSubmit = freshAction.beasts.filter((beast) => {
                   const stats = liveStatsForAttempt?.get(beast.token_id);
-                  return resolveEffectiveHealth(stats, beast) <= 0;
+                  return resolveSelectionEffectiveHealth(beast.token_id, stats, beast) <= 0;
                 });
                 logger.warn(
                   `[L0] Submit single-token verify recovered alive=${recoveredAlive}/${initialDeadCount} from batch-dead attackers`
@@ -2056,13 +2420,38 @@ async function executeAttackWithRetry(
       // Pre-budget revival potions when dead beasts are selected so we don't
       // waste the first attempt with revivalPotions=0.
       let excludedOverCapDuringPrebudget = 0;
+      let deadSelectedDuringPrebudget = 0;
       if (revivalModeForAttempt) {
         for (const b of selectedBeasts) {
           const tuple = tuplesByToken.get(b.token_id);
           const attackCountForBeast = Math.max(1, Number(tuple?.[1] ?? 1));
           const liveState = liveStatsForAttempt?.get(b.token_id);
-          const isDead = resolveEffectiveHealth(liveState, b) <= 0;
-          if (!isDead) continue;
+          const pinnedRequired = Math.max(
+            0,
+            Number(requiredRevivalPotions.get(b.token_id) ?? 0)
+          );
+          const preservePinnedRevivalRequirement =
+            pinnedRequired > 0 &&
+            focusedRetryTokenId === b.token_id &&
+            !forceRevivalWhileAlive;
+          const effectiveSelectionHealth = resolveSelectionEffectiveHealth(
+            b.token_id,
+            liveState,
+            b
+          );
+          const isDead = effectiveSelectionHealth <= 0;
+          if (!isDead) {
+            if (preservePinnedRevivalRequirement) {
+              deadSelectedDuringPrebudget += 1;
+              logger.debug(
+                `[L0] Preserving focused revival requirement for beast ${b.token_id} despite alive live-stat mismatch (required=${pinnedRequired})`
+              );
+              continue;
+            }
+            requiredRevivalPotions.delete(b.token_id);
+            continue;
+          }
+          deadSelectedDuringPrebudget += 1;
           const revivalCount = Math.max(
             0,
             Number(liveState?.revival_count ?? b.revival_count ?? 0)
@@ -2071,7 +2460,7 @@ async function executeAttackWithRetry(
             revivalCount,
             attackCountForBeast
           );
-          if (estimatedRaw > maxRevivalPotionsPerBeast) {
+          if (estimatedRaw > effectiveMaxRevivalPotionsPerBeast) {
             excludeOverCapRevivalBeast(
               b.token_id,
               estimatedRaw,
@@ -2080,7 +2469,7 @@ async function executeAttackWithRetry(
             excludedOverCapDuringPrebudget += 1;
             continue;
           }
-          const estimated = Math.min(maxRevivalPotionsPerBeast, estimatedRaw);
+          const estimated = Math.min(effectiveMaxRevivalPotionsPerBeast, estimatedRaw);
           if (!requiredRevivalPotions.has(b.token_id)) {
             requiredRevivalPotions.set(b.token_id, estimated);
           }
@@ -2088,6 +2477,14 @@ async function executeAttackWithRetry(
         if (excludedOverCapDuringPrebudget > 0) {
           logger.info(
             `[L0] Excluded ${excludedOverCapDuringPrebudget} over-cap dead beasts during pre-budget — recomputing attack set`
+          );
+          continue;
+        }
+        if (deadSelectedDuringPrebudget === 0) {
+          clearRevivalFocus();
+          revivalModeForAttempt = false;
+          logger.info(
+            "[L0] Revival mode selected only alive attackers on-chain — clearing stale revival state and retrying without revival"
           );
           continue;
         }
@@ -2214,7 +2611,6 @@ async function executeAttackWithRetry(
 
       // SUCCESS!
       consecutiveL1Failures = 0;
-      consecutiveRevivalFastExcludes = 0;
       logger.info(
         `ATTACK SUCCESS! tx=${result.txHash} captured=${captured ? "yes" : "no"} profile=${profileId ?? "n/a"}`
       );
@@ -2540,101 +2936,37 @@ async function executeAttackWithRetry(
         if (revivalNeedsMatch && !revivalModeForAttempt) {
           const beastId = parseInt(revivalNeedsMatch[1]!, 10);
           const needed = parseInt(revivalNeedsMatch[2]!, 10);
-          const aliveAlternativesInSnapshot = getAliveCandidateCount(
-            currentSnapshot.ourBeasts.filter((beast) => beast.token_id !== beastId)
-          );
-          if (aliveAlternativesInSnapshot > 0) {
-            // Fast-exclude: when alive beasts exist, don't waste attempts
-            // retrying revival for stale-dead beasts. The focused revival
-            // retry path (forceRevivalWhileAlive) burns 2-3 extra RPC calls
-            // per dead beast before reaching REVIVAL_STUCK_RETRY_LIMIT.
-            // With broad rotation cycling through many beasts, this cascade
-            // compounds: 80 dead beasts × 3 wasted calls = 240 lost attempts.
+          let aliveCandidatesOnchain = 0;
+          try {
+            aliveCandidatesOnchain = await getAliveCandidateCountOnchain(true);
+          } catch {
+            aliveCandidatesOnchain = getAliveCandidateCount();
+          }
+
+          if (aliveCandidatesOnchain > 0) {
             excludedTokenIds.add(beastId);
             requiredRevivalPotions.delete(beastId);
             clearFocusedRetryToken(beastId);
-            beastCooldownExclusions.set(beastId, Date.now() + 2 * 60 * 60 * 1000);
+            const cooldownMs = getPrecheckCooldownMs(6 * 60 * 60 * 1000);
+            beastCooldownExclusions.set(beastId, Date.now() + cooldownMs);
             lastRevivalSignal = null;
             repeatedRevivalSignals = 0;
-            consecutiveRevivalFastExcludes += 1;
-            discoveredRevivalNeeds.set(beastId, needed);
-            // Track which beasts were in this batch for bail-out
-            if (consecutiveRevivalFastExcludes === 1) {
-              lastBatchBeastIds = freshAction.beasts.map((b) => b.token_id);
-            }
             logger.info(
-              `[L2] Beast ${beastId} requires revival but alive alternatives=${aliveAlternativesInSnapshot} remain — excluding (streak=${consecutiveRevivalFastExcludes})`
+              `[L2] Beast ${beastId} requires ${needed} revival potions but ${aliveCandidatesOnchain} alive beasts remain on-chain — excluding for ${Math.floor(
+                cooldownMs / 60_000
+              )}m`
             );
-
-            // Combat-death recovery: after N consecutive "requires revival" errors,
-            // the batch contains beasts killed in previous combats. Dead beasts
-            // take 24h to naturally revive or can be revived instantly with
-            // revival potions. Pre-exclude remaining untested beasts for 2h
-            // (they won't naturally revive anytime soon), then batch-revive
-            // ALL discovered dead beasts using their exact potion needs.
-            // Since we pre-exclude alive/untested beasts, only the known-dead
-            // beasts pass the filter → homogeneous dead batch → contract accepts.
-            if (consecutiveRevivalFastExcludes >= REVIVAL_FAST_EXCLUDE_BAIL_THRESHOLD && revivalEnabledByConfig) {
-              const remainingInBatch = lastBatchBeastIds.filter(
-                (id) => !excludedTokenIds.has(id)
-              );
-              // Pre-exclude remaining untested beasts for 2h. Dead beasts take
-              // 24h to naturally revive, so re-testing them sooner is wasteful.
-              if (remainingInBatch.length > 0) {
-                for (const id of remainingInBatch) {
-                  excludedTokenIds.add(id);
-                  beastCooldownExclusions.set(id, Date.now() + 2 * 60 * 60 * 1000);
-                }
-              }
-              // Un-exclude ALL discovered dead beasts that fit within revival cap.
-              // Set their exact revival needs (from error messages, not estimates).
-              // With focusedRetryTokenId=null, the engine picks them all as a batch.
-              const revivableTargets: { id: number; needed: number }[] = [];
-              for (const [dBeastId, dNeeded] of discoveredRevivalNeeds) {
-                if (dNeeded <= maxRevivalPotionsPerBeast) {
-                  excludedTokenIds.delete(dBeastId);
-                  beastCooldownExclusions.delete(dBeastId);
-                  requiredRevivalPotions.set(dBeastId, dNeeded);
-                  revivableTargets.push({ id: dBeastId, needed: dNeeded });
-                }
-              }
-              if (revivableTargets.length > 0) {
-                // Don't pin to one beast — let the engine batch all of them.
-                focusedRetryTokenId = null;
-                forceRevivalWhileAlive = true;
-              }
-              const savedCalls = remainingInBatch.length;
-              const totalPotions = revivableTargets.reduce((s, t) => s + t.needed, 0);
-              consecutiveRevivalFastExcludes = 0;
-              discoveredRevivalNeeds.clear();
-              logger.warn(
-                `[L2] Combat-death recovery: ${REVIVAL_FAST_EXCLUDE_BAIL_THRESHOLD} consecutive revival failures — ` +
-                `pre-excluded ${savedCalls} beasts (2h cooldown), ` +
-                (revivableTargets.length > 0
-                  ? `batch-reviving ${revivableTargets.length} dead beasts [${revivableTargets.map(t => `${t.id}×${t.needed}`).join(', ')}] (total=${totalPotions} potions)`
-                  : `no revivable beasts found`) +
-                ` (saved ~${savedCalls} failed RPC calls)`
-              );
-              continue;
-            }
-
-            // Bulk pre-exclude: if one beast in the batch is stale-dead,
-            // others likely are too. Probe on-chain to exclude them all at
-            // once instead of discovering them one-by-one (each costs a failed tx).
-            // NOTE: This only catches beasts with health=0 on-chain, NOT daily deaths
-            // (which show health>0). The daily-death recovery above handles those.
             if (freshAction.beasts.length > 1) {
               try {
                 const live = await chain.getLiveStats(freshAction.beasts.map((b) => b.token_id));
                 const deadBatch = freshAction.beasts.filter((b) => {
-                  if (b.token_id === beastId) return false; // already excluded above
                   const stats = live.get(b.token_id);
-                  return resolveEffectiveHealth(stats, b) <= 0;
+                  return !!stats && Number(stats.health ?? 0) <= 0;
                 });
-                if (deadBatch.length > 0) {
-                  excludeStaleDeadBeasts(deadBatch, 2 * 60 * 60 * 1000);
+                if (deadBatch.length > 1) {
+                  excludeStaleDeadBeasts(deadBatch, 6 * 60 * 60 * 1000);
                   logger.info(
-                    `[L2] Bulk pre-excluded ${deadBatch.length} additional stale-dead beasts from batch`
+                    `[L2] Bulk excluded ${deadBatch.length} dead attackers after on-chain alive preference`
                   );
                 }
               } catch {
@@ -2643,20 +2975,24 @@ async function executeAttackWithRetry(
             }
             continue;
           }
-          if (revivalEnabledByConfig && needed <= maxRevivalPotionsPerBeast) {
-            const focusedNeeded = Math.max(1, Math.min(maxRevivalPotionsPerBeast, needed));
+
+          const shouldForcePolicyRevive =
+            revivalEnabledByConfig &&
+            needed <= effectiveMaxRevivalPotionsPerBeast;
+          if (shouldForcePolicyRevive) {
+            const focusedNeeded = Math.max(1, Math.min(effectiveMaxRevivalPotionsPerBeast, needed));
             requiredRevivalPotions.set(beastId, focusedNeeded);
             focusedRetryTokenId = beastId;
-            forceRevivalWhileAlive = true;
+            forceRevivalWhileAlive = false;
             lastRevivalSignal = null;
             repeatedRevivalSignals = 0;
             logger.info(
-              `[L2] Beast ${beastId} requires revival while tested-as-alive — forcing focused revival retry (${focusedNeeded})`
+              `[L2] Beast ${beastId} requires revival and no on-chain alive attackers remain — forcing focused revival retry (${focusedNeeded})`
             );
             continue;
           }
 
-          if (needed > maxRevivalPotionsPerBeast) {
+          if (needed > effectiveMaxRevivalPotionsPerBeast) {
             excludeOverCapRevivalBeast(beastId, needed, "revert/non-revival-mode");
             lastRevivalSignal = null;
             repeatedRevivalSignals = 0;
@@ -2677,7 +3013,7 @@ async function executeAttackWithRetry(
               const live = await chain.getLiveStats(freshAction.beasts.map((b) => b.token_id));
               const deadBatch = freshAction.beasts.filter((b) => {
                 const stats = live.get(b.token_id);
-                return resolveEffectiveHealth(stats, b) <= 0;
+                return resolveSelectionEffectiveHealth(b.token_id, stats, b) <= 0;
               });
               if (deadBatch.length > 1) {
                 excludeStaleDeadBeasts(deadBatch, 12 * 60 * 60 * 1000);
@@ -2708,7 +3044,7 @@ async function executeAttackWithRetry(
             ? estimateDeadBeastRevivalBudget(Number(beastState.revival_count ?? 0), attackCountForBeast)
             : 0;
           const neededTotalForBeast = Math.max(needed, estimatedFromState);
-          if (neededTotalForBeast > maxRevivalPotionsPerBeast) {
+          if (neededTotalForBeast > effectiveMaxRevivalPotionsPerBeast) {
             excludeOverCapRevivalBeast(beastId, neededTotalForBeast, "revert/revival-mode");
             lastRevivalSignal = null;
             repeatedRevivalSignals = 0;
@@ -2728,7 +3064,7 @@ async function executeAttackWithRetry(
           // Contract expects exact required revival amount for this beast.
           requiredRevivalPotions.set(
             beastId,
-            Math.min(maxRevivalPotionsPerBeast, neededTotalForBeast)
+            Math.min(effectiveMaxRevivalPotionsPerBeast, neededTotalForBeast)
           );
           forcedRevivalFloor = 0;
           focusedRetryTokenId = beastId;
