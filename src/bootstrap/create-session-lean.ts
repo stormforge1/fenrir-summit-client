@@ -56,6 +56,9 @@ async function main(): Promise<void> {
   if (functionNames.has("apply_poison")) {
     summitMethods.push({ name: "apply_poison", entrypoint: "apply_poison" });
   }
+  if (functionNames.has("add_extra_life")) {
+    summitMethods.push({ name: "add_extra_life", entrypoint: "add_extra_life" });
+  }
 
   console.log(`  Attack entrypoint preference: ${attackCandidates[0]}`);
   console.log(`  Summit request_random: ${functionNames.has("request_random") ? "yes" : "no (external VRF only)"}`);

@@ -8,14 +8,19 @@ import { loadSummitAbi } from "../chain/abi.js";
 const SHALOMBRUDER = "0x00Df433279d2EeA7F73e8bdFBCE78931Ac768BF77fcE7d319149a7FD367D59a7";
 const CHAIN_ID_SN_MAIN = "0x534e5f4d41494e";
 
+function resultToBigInt(raw: unknown): bigint {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return BigInt(String(value));
+}
+
 async function main() {
   const config = loadConfig("public-config/runner.json");
   const provider = new RpcProvider({ nodeUrl: config.chain.rpcUrl, blockIdentifier: "latest" });
   const abi = await loadSummitAbi(config.chain.rpcUrl, config.chain.summitContract);
   const contract = new Contract(abi, config.chain.summitContract, provider);
 
-  const attackAddr = "0x" + BigInt(await contract.call("get_attack_potion_address", [])).toString(16);
-  const reviveAddr = "0x" + BigInt(await contract.call("get_revive_potion_address", [])).toString(16);
+  const attackAddr = "0x" + resultToBigInt(await contract.call("get_attack_potion_address", [])).toString(16);
+  const reviveAddr = "0x" + resultToBigInt(await contract.call("get_revive_potion_address", [])).toString(16);
   console.log("ATTACK token:", attackAddr);
   console.log("REVIVE token:", reviveAddr);
 
@@ -27,8 +32,8 @@ async function main() {
   const attackToken = new Contract(erc20Abi, attackAddr, provider);
   const reviveToken = new Contract(erc20Abi, reviveAddr, provider);
 
-  const atkAmount = BigInt(await attackToken.call("balanceOf", [config.account.controllerAddress]) as any);
-  const revAmount = BigInt(await reviveToken.call("balanceOf", [config.account.controllerAddress]) as any);
+  const atkAmount = resultToBigInt(await attackToken.call("balanceOf", [config.account.controllerAddress]));
+  const revAmount = resultToBigInt(await reviveToken.call("balanceOf", [config.account.controllerAddress]));
   console.log("ATTACK balance:", atkAmount.toString());
   console.log("REVIVE balance:", revAmount.toString());
 

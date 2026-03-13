@@ -212,6 +212,22 @@ function decodeHexFelts(errStr: string): string {
   });
 }
 
+function isSessionNotRegisteredError(message: string): boolean {
+  const normalized = String(message).toLowerCase();
+  return (
+    normalized.includes("session/not-registered") ||
+    normalized.includes("session not registered")
+  );
+}
+
+function isValidationResourceLimitError(message: string): boolean {
+  const normalized = String(message).toLowerCase();
+  return (
+    normalized.includes("insufficient resources for validation") ||
+    normalized.includes("code=53")
+  );
+}
+
 const HARD_MAX_REVIVAL_POTIONS_PER_BEAST = 88;
 const HARD_MAX_EXTRA_LIFE_POTIONS_PER_ATTACK = 5;
 const ATTACK_POTION_ALLOWANCE_FALLBACK_MS = 30 * 60 * 1000;
@@ -223,11 +239,12 @@ let revivalAllowanceFallbackUntil = 0;
 let extraLifePermanentlyDisabled = false;
 let enforceSessionReRegistrationOnAllowance = true;
 let sessionReRegistrationCommand =
-  "NODE_OPTIONS='--experimental-wasm-modules' npx tsx src/bootstrap/create-session.ts config/userprofile.json";
+  "NODE_OPTIONS='--experimental-wasm-modules --dns-result-order=ipv4first' npx tsx src/bootstrap/create-session.ts config/userprofile.json";
 let sessionReRegistrationReminderMs = 60_000;
 let sessionReRegistrationSleepMs = 15_000;
 let sessionReRegistrationRequired = false;
 let lastSessionReRegistrationReminderAt = 0;
+let runtimeDisableVrfForAttacks = false;
 
 function getSessionRegistrationScript(config: import("./config.js").FenrirConfig): string {
   const dirName = String(config.session.dirName ?? "").toLowerCase();
@@ -503,7 +520,7 @@ async function main() {
 
   const logger = new Logger("summit-agent", config.logging.eventsFile);
   const sessionRegistrationScript = getSessionRegistrationScript(config);
-  sessionReRegistrationCommand = `NODE_OPTIONS='--experimental-wasm-modules' npx tsx ${sessionRegistrationScript} ${configPath}`;
+  sessionReRegistrationCommand = `NODE_OPTIONS='--experimental-wasm-modules --dns-result-order=ipv4first' npx tsx ${sessionRegistrationScript} ${configPath}`;
   enforceSessionReRegistrationOnAllowance =
     process.env.FENRIR_REQUIRE_SESSION_REREG_ON_ALLOWANCE !== "0";
   sessionReRegistrationReminderMs = Math.max(
@@ -516,6 +533,7 @@ async function main() {
   );
   sessionReRegistrationRequired = false;
   lastSessionReRegistrationReminderAt = 0;
+  runtimeDisableVrfForAttacks = process.env.FENRIR_DISABLE_VRF === "1";
   const runnerLock = acquireRunnerLock(config, logger);
   if (!runnerLock) {
     process.exit(1);
@@ -1036,7 +1054,7 @@ async function main() {
         if (holderIsProtected) {
           // Ally boost: give pikasuuu extra lives when holding with power > 350
           const ALLY_BOOST_ADDRESS = "0x4ebbee02cd68cbdee16b4d60932264cb195341d5adb82870a5d233b980bb622";
-          const ALLY_BOOST_EXTRA_LIVES = 3;
+          const ALLY_BOOST_EXTRA_LIVES = 1;
           const ALLY_BOOST_MIN_POWER = 350;
           const ALLY_BOOST_INTERVAL_MS = 30_000;
           const allyTokenIds = protectedTokenIdsByOwner.get(ALLY_BOOST_ADDRESS);
@@ -1465,6 +1483,10 @@ async function executeAttackWithRetry(
     extraLifePermanentlyDisabled || Date.now() < extraLifeAllowanceFallbackUntil;
   const isRevivalAllowanceFallbackActive = (): boolean =>
     Date.now() < revivalAllowanceFallbackUntil;
+  const VRF_SEED_REQUEST_MIN_INTERVAL_MS = 1_000;
+  const VRF_SEED_WAIT_MS = 1_500;
+  let lastVrfSeedRequestAt = 0;
+  let consecutiveVrfSeedPreparationFailures = 0;
   let excludedTokenIds = new Set<number>();
   let requiredRevivalPotions = new Map<number, number>();
   let forcedRevivalFloor = 0;
@@ -2681,6 +2703,9 @@ async function executeAttackWithRetry(
 
       const payloadForAttempt = {
         ...basePayload,
+        useVrf:
+          (basePayload.useVrf === undefined ? true : basePayload.useVrf === true) &&
+          !runtimeDisableVrfForAttacks,
         attackingBeasts,
         revivalPotions: effectiveRevivalPotions,
         extraLifePotions: effectiveExtraLifePotions,
@@ -2712,6 +2737,7 @@ async function executeAttackWithRetry(
 
       logger.info(`Attack attempt ${attempt}/${MAX_ATTEMPTS}: ${selectedBeasts.length} beasts, revivalPotions=${effectiveRevivalPotions}`, {
         profileId: typeof basePayload.profileId === "string" ? basePayload.profileId : null,
+        useVrf: payloadForAttempt.useVrf === true,
         attackPotionAllowanceFallback: disableAttackPotionSpendForAttempt,
         extraLifePotionAllowanceFallback: disableExtraLifePotionSpendForAttempt,
         attackers: selectedBeasts.map((b, idx) => {
@@ -2726,6 +2752,50 @@ async function executeAttackWithRetry(
           };
         }),
       });
+
+      if (payloadForAttempt.useVrf === true) {
+        let skipVrfWaitAfterSeed = false;
+        const now = Date.now();
+        if (now - lastVrfSeedRequestAt >= VRF_SEED_REQUEST_MIN_INTERVAL_MS) {
+          try {
+            const vrfSeed = await chain.requestRandomSeed();
+            lastVrfSeedRequestAt = Date.now();
+            consecutiveVrfSeedPreparationFailures = 0;
+            logger.info(`[L2V] VRF seed requested tx=${vrfSeed.txHash}`);
+          } catch (seedErr) {
+            const seedErrStr = serializeError(seedErr);
+            if (isSessionNotRegisteredError(seedErrStr)) {
+              markSessionReRegistrationRequired(
+                logger,
+                "Session missing VRF provider registration (request_random denied)"
+              );
+              await sleep(Math.max(1_000, config.api.pollIntervalMs));
+              return;
+            }
+            if (isValidationResourceLimitError(seedErrStr)) {
+              consecutiveVrfSeedPreparationFailures += 1;
+              if (consecutiveVrfSeedPreparationFailures >= 2) {
+                runtimeDisableVrfForAttacks = true;
+                consecutiveVrfSeedPreparationFailures = 0;
+                payloadForAttempt.useVrf = false;
+                skipVrfWaitAfterSeed = true;
+                logger.warn(
+                  "[L2V] VRF seed requests failed repeatedly (code=53). Switching to non-VRF attacks for this run."
+                );
+              }
+            } else {
+              consecutiveVrfSeedPreparationFailures = 0;
+            }
+            logger.warn(
+              `[L2V] VRF seed request failed (will still try attack): ${seedErrStr.substring(0, 260)}`
+            );
+          }
+        }
+        if (!skipVrfWaitAfterSeed) {
+          await sleep(VRF_SEED_WAIT_MS);
+        }
+      }
+
       const result = await chain.attack(payloadForAttempt);
       const profileId =
         typeof (payloadForAttempt as { profileId?: unknown }).profileId === "string"
@@ -2749,6 +2819,7 @@ async function executeAttackWithRetry(
 
       // SUCCESS!
       consecutiveL1Failures = 0;
+      consecutiveVrfSeedPreparationFailures = 0;
       logger.info(
         `ATTACK SUCCESS! tx=${result.txHash} captured=${captured ? "yes" : "no"} profile=${profileId ?? "n/a"}`
       );
@@ -2789,6 +2860,62 @@ async function executeAttackWithRetry(
 
       // Combine raw + decoded for regex matching
       const matchStr = errStr + " " + decodedErr;
+      const matchStrLower = matchStr.toLowerCase();
+      if (isSessionNotRegisteredError(matchStrLower)) {
+        markSessionReRegistrationRequired(
+          logger,
+          "Session is not registered for one of the required contract calls"
+        );
+        await sleep(Math.max(1_000, config.api.pollIntervalMs));
+        return;
+      }
+
+      const vrfNotFulfilled =
+        matchStrLower.includes("vrfprovider") && matchStrLower.includes("not fulfilled");
+      const missingVrfSeed = matchStrLower.includes("missing vrf seed");
+      if (vrfNotFulfilled || missingVrfSeed) {
+        const now = Date.now();
+        if (now - lastVrfSeedRequestAt >= VRF_SEED_REQUEST_MIN_INTERVAL_MS) {
+          try {
+            const vrfSeed = await chain.requestRandomSeed();
+            lastVrfSeedRequestAt = Date.now();
+            consecutiveVrfSeedPreparationFailures = 0;
+            logger.info(`[L2V] VRF seed requested after failure tx=${vrfSeed.txHash}`);
+          } catch (seedErr) {
+            const seedErrStr = serializeError(seedErr);
+            if (isSessionNotRegisteredError(seedErrStr)) {
+              markSessionReRegistrationRequired(
+                logger,
+                "Session missing VRF provider registration (request_random denied)"
+              );
+              await sleep(Math.max(1_000, config.api.pollIntervalMs));
+              return;
+            }
+            if (isValidationResourceLimitError(seedErrStr)) {
+              consecutiveVrfSeedPreparationFailures += 1;
+              if (consecutiveVrfSeedPreparationFailures >= 2 && vrfNotFulfilled) {
+                runtimeDisableVrfForAttacks = true;
+                consecutiveVrfSeedPreparationFailures = 0;
+                logger.warn(
+                  "[L2V] VRF not fulfilled and seed requests keep failing (code=53). Switching to non-VRF attacks and retrying."
+                );
+                await sleep(350);
+                continue;
+              }
+            } else {
+              consecutiveVrfSeedPreparationFailures = 0;
+            }
+            logger.warn(
+              `[L2V] VRF seed request after failure failed: ${seedErrStr.substring(0, 260)}`
+            );
+          }
+        }
+        logger.warn(
+          `[L2V] ${vrfNotFulfilled ? "VRF not fulfilled" : "Missing VRF seed"} — waiting ${VRF_SEED_WAIT_MS}ms before retry`
+        );
+        await sleep(VRF_SEED_WAIT_MS);
+        continue;
+      }
 
       if (
         matchStr.includes("ERC20: insufficient allowance") ||

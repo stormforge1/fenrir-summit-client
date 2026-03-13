@@ -73,6 +73,7 @@ const state = {
       runnerMode: "Idle",
       lastSignal: "No signal yet",
     },
+    lastRunnerIssue: "",
   },
 };
 
@@ -448,6 +449,7 @@ function resetUiForUnavailableApi() {
   state.ui.sessionValid = false;
   state.ui.runnerRunning = false;
   state.ui.configDirty = false;
+  state.ui.lastRunnerIssue = "";
   state.ui.battleStats = summarizeBattleStats("", false);
   renderBattleStats();
   updateSetupProgress();
@@ -1030,6 +1032,7 @@ async function loadProfiles(preferredProfileId) {
     state.config = null;
     state.ui.sessionValid = false;
     state.ui.runnerRunning = false;
+    state.ui.lastRunnerIssue = "";
     els.profileBadge.textContent = "No profile";
     setRunnerChip("No profile", "off");
     setSessionChip("No profile", "off");
@@ -1195,7 +1198,10 @@ async function refreshRunnerStatus() {
 
   const status = await requestJson(`/api/profiles/${encodeURIComponent(state.profileId)}/status?lines=140`);
 
-  if (status.running) {
+  if (status.requiresSessionReregistration) {
+    setRunnerChip("Action Required", "warn");
+    state.ui.runnerRunning = false;
+  } else if (status.running) {
     setRunnerChip("Running", "on");
     state.ui.runnerRunning = true;
   } else {
@@ -1207,7 +1213,17 @@ async function refreshRunnerStatus() {
     ? status.processes.map((proc) => proc.pid).join(", ")
     : "none";
   const screenText = status.hasScreenSession ? status.screenSessionName : "none";
-  els.runnerMeta.textContent = `PIDs: ${pidText} | Screen: ${screenText}`;
+  const issueText =
+    status.runnerIssue && typeof status.runnerIssue === "string"
+      ? ` | Issue: ${status.runnerIssue.replace(/\s+/g, " ").trim().slice(0, 180)}`
+      : "";
+  els.runnerMeta.textContent = `PIDs: ${pidText} | Screen: ${screenText}${issueText}`;
+
+  const runnerIssue = typeof status.runnerIssue === "string" ? status.runnerIssue : "";
+  if (runnerIssue && runnerIssue !== state.ui.lastRunnerIssue) {
+    setMessage(runnerIssue, "error");
+  }
+  state.ui.lastRunnerIssue = runnerIssue;
 
   els.logPath.textContent = status.logPath;
   if (status.logTail?.trim()) {

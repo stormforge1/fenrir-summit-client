@@ -187,6 +187,8 @@ async function fetchRunnerStatus(profileId: string, lines = 100): Promise<{
   screenSessionName: string;
   logPath: string;
   logTail: string;
+  requiresSessionReregistration: boolean;
+  runnerIssue: string | null;
 }> {
   const configPath = configPathFor(profileId);
   const pattern = `src/index.ts ${configPath}`;
@@ -219,6 +221,43 @@ async function fetchRunnerStatus(profileId: string, lines = 100): Promise<{
     logTail = tail.stdout;
   }
 
+  const tailLines = logTail
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const lastLockAcquireIndex = (() => {
+    for (let i = tailLines.length - 1; i >= 0; i -= 1) {
+      if (tailLines[i].includes("[LOCK] Acquired runner lock")) {
+        return i;
+      }
+    }
+    return -1;
+  })();
+  const activeTailLines =
+    lastLockAcquireIndex >= 0 ? tailLines.slice(lastLockAcquireIndex) : tailLines;
+  const sessionReminderLine =
+    [...activeTailLines].reverse().find((line) =>
+      line.includes("[SESSION] Waiting for session re-registration approval")
+    ) ?? null;
+  const sessionRequiredLine =
+    [...activeTailLines].reverse().find((line) =>
+      line.includes("[SESSION]") && line.toLowerCase().includes("re-register session")
+    ) ?? null;
+  const requiresSessionReregistration = Boolean(sessionReminderLine || sessionRequiredLine);
+  const hasVrfNotFulfilled = activeTailLines.some((line) =>
+    line.includes("VrfProvider: not fulfilled")
+  );
+  const hasVrfSeedValidationFailure = activeTailLines.some((line) =>
+    line.includes("[L2V]") &&
+    (line.toLowerCase().includes("insufficient resources for validation") ||
+      line.toLowerCase().includes("code=53"))
+  );
+  const runnerIssue = requiresSessionReregistration
+    ? (sessionReminderLine ?? sessionRequiredLine ?? "Session re-registration required")
+    : hasVrfNotFulfilled && hasVrfSeedValidationFailure
+      ? "VRF seed requests failing while attack reports 'VrfProvider: not fulfilled'. Re-register session."
+      : null;
+
   return {
     running: processes.length > 0 || hasScreenSession,
     processCount: processes.length,
@@ -227,6 +266,8 @@ async function fetchRunnerStatus(profileId: string, lines = 100): Promise<{
     screenSessionName,
     logPath,
     logTail,
+    requiresSessionReregistration,
+    runnerIssue,
   };
 }
 

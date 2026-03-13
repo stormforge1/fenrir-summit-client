@@ -48,6 +48,7 @@ export const ConfigSchema = z.object({
     attackCountPerBeast: z.number().int().positive().default(1),
     useRevivalPotions: z.boolean().default(true),
     maxRevivalPotionsPerBeast: z.number().int().nonnegative().max(75).default(10),
+    alwaysAttackOwners: z.array(z.string()).default([]),
     protectedOwners: z.array(z.string()).default([]),
     friendlyPlayers: z.array(z.object({
       name: z.string().default(""),
@@ -64,9 +65,11 @@ export const ConfigSchema = z.object({
     burstAttackPotionsPerBeast: z.number().int().nonnegative().default(3),
     burstMinTypeAdvantage: z.number().min(1).max(1.5).default(1.5),
     usePoisonOnHighExtraLives: z.boolean().default(false),
+    poisonMinHolderPower: z.number().int().nonnegative().default(0),
     poisonHolderExtraLivesThreshold: z.number().int().nonnegative().default(1),
     poisonCountPerCast: z.number().int().positive().default(1),
     poisonExtraLivesMultiplier: z.number().int().min(1).max(3).default(1),
+    poisonMaxTotalPerBeast: z.number().int().positive().default(100_000),
     poisonCooldownMs: z.number().int().positive().default(20_000),
     sendAllBeasts: z.boolean().default(true),
     maxBeastsProfiles: z.object({

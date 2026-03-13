@@ -74,6 +74,9 @@ export class ChainClient {
       nodeUrl: this.config.chain.rpcUrl,
       blockIdentifier: "latest",
     });
+    const isLeanSession = String(this.config.session.dirName ?? "")
+      .toLowerCase()
+      .includes("lean");
 
     // Load ABI
     const abi = await loadSummitAbi(this.config.chain.rpcUrl, this.config.chain.summitContract);
@@ -100,10 +103,10 @@ export class ChainClient {
     if (this.hasRequestRandom) {
       summitMethods.push({ name: "request_random", entrypoint: "request_random" });
     }
-    if (this.functionNames.has("claim_rewards")) {
+    if (!isLeanSession && this.functionNames.has("claim_rewards")) {
       summitMethods.push({ name: "claim_rewards", entrypoint: "claim_rewards" });
     }
-    if (this.functionNames.has("claim_quest_rewards")) {
+    if (!isLeanSession && this.functionNames.has("claim_quest_rewards")) {
       summitMethods.push({ name: "claim_quest_rewards", entrypoint: "claim_quest_rewards" });
     }
     if (this.hasApplyPoison) {
@@ -112,11 +115,18 @@ export class ChainClient {
     if (this.hasAddExtraLife) {
       summitMethods.push({ name: "add_extra_life", entrypoint: "add_extra_life" });
     }
-    const potionTokenAddresses = await discoverPotionTokenAddresses(
-      this.contract,
-      this.functionNames,
-      { retriesPerGetter: 6, retryDelayMs: 250 }
-    );
+    let potionTokenAddresses: string[] = [];
+    if (!isLeanSession) {
+      potionTokenAddresses = await discoverPotionTokenAddresses(
+        this.contract,
+        this.functionNames,
+        { retriesPerGetter: 6, retryDelayMs: 250 }
+      );
+    } else {
+      this.logger.info(
+        "[SESSION] Lean session mode enabled: skipping token approve policy expansion"
+      );
+    }
     const sessionApprovalAmount =
       process.env.FENRIR_SESSION_APPROVAL_AMOUNT ?? SESSION_APPROVAL_AMOUNT_DEFAULT;
     this.potionTokenAddresses = potionTokenAddresses;
@@ -126,6 +136,7 @@ export class ChainClient {
       attackEntrypoint: this.attackEntrypoint,
       hasRequestRandom: this.hasRequestRandom,
       hasAddExtraLife: this.hasAddExtraLife,
+      leanSessionMode: isLeanSession,
       sessionMethods: summitMethods.map((m) => m.entrypoint),
       approvalTokens: potionTokenAddresses.length,
       extraLifePotionCap: this.extraLifePotionPerTxCap,
@@ -741,6 +752,50 @@ export class ChainClient {
     return { txHash, receipt };
   }
 
+  async requestRandomSeed(): Promise<{ txHash: string; receipt: any }> {
+    const accountAddress = this.sessionAccount?.address ?? this.config.account.controllerAddress;
+    const calls: Array<{ contractAddress: string; entrypoint: string; calldata: string[] }> = [];
+
+    if (this.hasRequestRandom) {
+      const requestRandomCall = this.contract.populate("request_random", []);
+      const requestRandomCalldata = (requestRandomCall.calldata ?? []) as string[];
+      calls.push({
+        contractAddress: this.config.chain.summitContract,
+        entrypoint: "request_random",
+        calldata: requestRandomCalldata,
+      });
+    } else {
+      // request_random(caller=Summit, source=Nonce(account)) on external VRF provider.
+      calls.push({
+        contractAddress: VRF_PROVIDER_ADDRESS,
+        entrypoint: "request_random",
+        calldata: [this.config.chain.summitContract, "0", accountAddress],
+      });
+    }
+
+    this.logger.debug(
+      `[VRF] Requesting random seed via ${this.hasRequestRandom ? "summit.request_random" : "external provider"}`
+    );
+    const result = await this.sessionAccount.execute(calls);
+    const txHash = (result as any)?.transaction_hash ?? (result as any)?.transactionHash;
+    if (!txHash) {
+      throw new Error("VRF seed request execute returned no transaction hash");
+    }
+    this.logger.info(`[VRF] Seed request tx submitted: ${txHash}`);
+
+    const receipt = await this.provider.waitForTransaction(txHash, {
+      retryInterval: this.config.chain.txWaitIntervalMs,
+    });
+
+    const execStatus = (receipt as any).execution_status;
+    if (execStatus === "REVERTED") {
+      const revertReason = (receipt as any).revert_reason || "unknown";
+      throw new Error(`VRF seed request REVERTED: ${revertReason}`);
+    }
+
+    return { txHash, receipt };
+  }
+
   async attack(payload: {
     defendingBeastTokenId: number;
     attackingBeasts: Array<[number, number, number]>; // [tokenId, attackCount, attackPotions]
@@ -779,27 +834,8 @@ export class ChainClient {
       throw new Error(`Failed to encode calldata for ${this.attackEntrypoint}`);
     }
 
-    // Build calls array — if VRF, prepend request_random
+    // Build calls array. VRF seed must be requested in a prior tx.
     const calls: Array<{ contractAddress: string; entrypoint: string; calldata: string[] }> = [];
-
-    if (effectiveVrf && this.hasRequestRandom) {
-      const requestRandomCall = this.contract.populate("request_random", []);
-      const requestRandomCalldata = (requestRandomCall.calldata ?? []) as string[];
-      calls.push({
-        contractAddress: this.config.chain.summitContract,
-        entrypoint: "request_random",
-        calldata: requestRandomCalldata,
-      });
-    } else if (effectiveVrf) {
-      const accountAddress = this.sessionAccount?.address ?? this.config.account.controllerAddress;
-      // request_random(caller=Summit, source=Nonce(account)) on external VRF provider.
-      // Summit later consumes with Source::Nonce(tx caller), so caller must be summitContract.
-      calls.push({
-        contractAddress: VRF_PROVIDER_ADDRESS,
-        entrypoint: "request_random",
-        calldata: [this.config.chain.summitContract, "0", accountAddress],
-      });
-    }
 
     calls.push({
       contractAddress: this.config.chain.summitContract,

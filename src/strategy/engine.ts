@@ -105,9 +105,20 @@ export class StrategyEngine {
     }
 
     const minHolderPower = this.config.strategy.minHolderPowerToAttack;
-    if (minHolderPower > 0 && summitHolder.basePower < minHolderPower) {
+    const alwaysAttackOwners = new Set(
+      (this.config.strategy.alwaysAttackOwners ?? []).map((address) =>
+        String(address).toLowerCase()
+      )
+    );
+    const forceAttackOwner = holderOwner.length > 0 && alwaysAttackOwners.has(holderOwner);
+    if (!forceAttackOwner && minHolderPower > 0 && summitHolder.basePower < minHolderPower) {
       this.logger.info(`Skipping holder: power ${summitHolder.basePower} < min ${minHolderPower}`);
       return { type: "wait" as const, reason: `Holder power ${summitHolder.basePower} below min ${minHolderPower}` };
+    }
+    if (forceAttackOwner && minHolderPower > 0 && summitHolder.basePower < minHolderPower) {
+      this.logger.info(
+        `[ENEMY] Forcing attack on holder owner ${holderOwner} despite power ${summitHolder.basePower} < min ${minHolderPower}`
+      );
     }
 
     const now = Date.now();

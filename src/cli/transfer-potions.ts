@@ -11,6 +11,11 @@ const DEFAULT_ROUTER = "0x04505a9f06f2bd639b6601f37a4dc0908bb70e8e0e0c34b1220827
 const CHAIN_ID_SN_MAIN = "0x534e5f4d41494e";
 const STRK_TRANSFER_AMOUNT = 2000n * 10n ** 18n; // 2000 STRK (18 decimals)
 
+function resultToBigInt(raw: unknown): bigint {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return BigInt(String(value));
+}
+
 async function main() {
   const config = loadConfig("public-config/runner.json");
   const provider = new RpcProvider({ nodeUrl: config.chain.rpcUrl, blockIdentifier: "latest" });
@@ -18,8 +23,8 @@ async function main() {
   const contract = new Contract(abi, config.chain.summitContract, provider);
 
   // Get potion token addresses
-  const attackAddr = "0x" + BigInt(await contract.call("get_attack_potion_address", [])).toString(16);
-  const reviveAddr = "0x" + BigInt(await contract.call("get_revive_potion_address", [])).toString(16);
+  const attackAddr = "0x" + resultToBigInt(await contract.call("get_attack_potion_address", [])).toString(16);
+  const reviveAddr = "0x" + resultToBigInt(await contract.call("get_revive_potion_address", [])).toString(16);
   console.log("ATTACK token:", attackAddr);
   console.log("REVIVE token:", reviveAddr);
 
@@ -36,9 +41,9 @@ async function main() {
   const revBal = await reviveToken.call("balanceOf", [config.account.controllerAddress]);
   const strkBal = await strkToken.call("balanceOf", [config.account.controllerAddress]);
 
-  const atkAmount = BigInt(atkBal as any);
-  const revAmount = BigInt(revBal as any);
-  const strkBalance = BigInt(strkBal as any);
+  const atkAmount = resultToBigInt(atkBal);
+  const revAmount = resultToBigInt(revBal);
+  const strkBalance = resultToBigInt(strkBal);
 
   console.log("ATTACK balance:", atkAmount.toString());
   console.log("REVIVE balance:", revAmount.toString());
