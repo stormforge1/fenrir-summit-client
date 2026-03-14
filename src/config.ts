@@ -38,6 +38,7 @@ export const ConfigSchema = z.object({
     ownerBeastsRefreshMs: z.number().int().positive().default(30_000),
     useAttackPotions: z.boolean().default(true),
     attackPotionsPerBeast: z.number().int().default(5),
+    dynamicAttackPotions: z.boolean().default(true),
     requireAttackPotionsForAllAttacks: z.boolean().default(false),
     pauseOnAttackPotionDepleted: z.boolean().default(true),
     useExtraLifePotions: z.boolean().default(false),

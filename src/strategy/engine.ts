@@ -21,6 +21,10 @@ type ProfileStats = {
 const HARD_MAX_REVIVAL_POTIONS_PER_BEAST = 88;
 const HARD_MAX_EXTRA_LIFE_POTIONS_PER_ATTACK = 5;
 const HYBRID_STREAK_REVIVE_EVERY_ATTACKS = 5;
+const DAMAGE_PRIORITY_MIN_HOLDER_POWER = 350;
+const ATTACK_POTION_STRONG_HOLDER_POWER = 500;
+const ATTACK_POTION_ELITE_HOLDER_POWER = 700;
+const ATTACK_POTION_CAP = 200;
 
 export class StrategyEngine {
   private config: FenrirConfig;
@@ -234,7 +238,27 @@ export class StrategyEngine {
         })
       : [];
 
-    if (streakTarget > 0 && belowStreakAny.length > 0) {
+    const prioritizeDamage = this.shouldPrioritizeDamage(summitHolder, isCaptureAttempt);
+
+    if (prioritizeDamage) {
+      pool = this.sortByDamageAndFreshnessAgainst(
+        viableAlive.length > 0 ? viableAlive : viableByRevival,
+        summitHolder
+      );
+      const strongest = pool[0];
+      const strongestNameMatch = strongest
+        ? this.getNameMatchScore(strongest, summitHolder)
+        : 0;
+      this.logger.info(
+        `[DMG] High-threat holder power=${summitHolder.basePower} — prioritizing max-damage attackers${
+          strongest
+            ? ` (top=${strongest.fullName} score=${strongest.score.toFixed(0)} typeAdv=${strongest.typeAdvantage}${
+                strongestNameMatch > 0 ? ` nameMatch=${strongestNameMatch}` : ""
+              })`
+            : ""
+        }`
+      );
+    } else if (streakTarget > 0 && belowStreakAny.length > 0) {
       pool = belowStreakAlive.length > 0 ? belowStreakAlive : belowStreakAny;
       this.logger.info(
         `[STREAK] Prioritizing ${belowStreakAny.length} beasts below streak ${streakTarget}`
@@ -268,6 +292,7 @@ export class StrategyEngine {
 
     const streakPriorityActive = streakTarget > 0 && belowStreakAny.length > 0;
     const shouldInjectDeadStreakRevive =
+      !prioritizeDamage &&
       streakTarget > 0 &&
       this.config.strategy.useRevivalPotions &&
       belowStreakAlive.length > 0 &&
@@ -283,11 +308,17 @@ export class StrategyEngine {
       );
     }
     const singleBeastRevivalStreakMode =
+      !prioritizeDamage &&
       revivalModeEnabled &&
       streakPriorityActive &&
       pool.some((beast) => !beast.isAlive);
     let attackers: ScoredBeast[];
-    if (forcedHybridRevival) {
+    if (prioritizeDamage) {
+      const maxBeasts = this.config.strategy.sendAllBeasts
+        ? Math.min(this.config.strategy.maxBeastsPerAttack, profile.maxBeasts)
+        : 1;
+      attackers = pool.slice(0, Math.max(1, Math.floor(maxBeasts)));
+    } else if (forcedHybridRevival) {
       attackers = pool.slice(0, 1);
       this.logger.info(
         "[STREAK] Hybrid mode active — injecting dead streak beast revival while alive attackers remain"
@@ -351,11 +382,21 @@ export class StrategyEngine {
       }
     }
 
-    // Attack potions: always use the fixed config value (no adaptive offsets)
     const fixedAttackPotionsPerBeast = this.config.strategy.useAttackPotions
       ? Math.max(1, Math.floor(this.config.strategy.attackPotionsPerBeast))
       : 0;
-    primaryAttackPotions = fixedAttackPotionsPerBeast;
+    primaryAttackPotions = this.getOptimizedAttackPotionsPerBeast({
+      summitHolder,
+      primary,
+      isCaptureAttempt,
+      prioritizeDamage,
+      fallback: fixedAttackPotionsPerBeast,
+    });
+    if (primaryAttackPotions !== fixedAttackPotionsPerBeast) {
+      this.logger.info(
+        `[POTS] Dynamic attack potions ${fixedAttackPotionsPerBeast}→${primaryAttackPotions} (holderPower=${summitHolder.basePower}, typeAdv=${primary?.typeAdvantage ?? 1}, capture=${isCaptureAttempt ? "yes" : "no"})`
+      );
+    }
 
     const attackingBeasts: Array<[number, number, number]> = attackers.map((b, idx) => {
       const baseAttackCount = idx === 0 ? primaryAttackCount : attackCountPerBeast;
@@ -364,7 +405,7 @@ export class StrategyEngine {
         baseAttackCount,
         levelTarget
       );
-      const perBeastAttackPotions = fixedAttackPotionsPerBeast;
+      const perBeastAttackPotions = primaryAttackPotions;
       return [
         b.token_id,
         perBeastAttackCount,
@@ -767,6 +808,117 @@ export class StrategyEngine {
 
       return b.score - a.score;
     });
+  }
+
+  private shouldPrioritizeDamage(
+    summitHolder: NonNullable<GameSnapshot["summitHolder"]>,
+    isCaptureAttempt: boolean
+  ): boolean {
+    if (!isCaptureAttempt) return false;
+    const minHolderPower = Math.max(0, Math.floor(this.config.strategy.minHolderPowerToAttack));
+    const threshold = Math.max(DAMAGE_PRIORITY_MIN_HOLDER_POWER, minHolderPower + 120);
+    return summitHolder.basePower >= threshold;
+  }
+
+  private getNameMatchScore(
+    attacker: Pick<ScoredBeast, "name" | "fullName">,
+    defender: Pick<ScoredBeast, "name" | "fullName">
+  ): number {
+    const attackerName = String(attacker.name ?? "").toLowerCase().trim();
+    const defenderName = String(defender.name ?? "").toLowerCase().trim();
+    if (!attackerName || !defenderName) return 0;
+    if (attackerName === defenderName) return 2;
+
+    const attackerFull = String(attacker.fullName ?? "").toLowerCase();
+    const defenderFull = String(defender.fullName ?? "").toLowerCase();
+    if (attackerFull.includes(defenderName) || defenderFull.includes(attackerName)) {
+      return 1;
+    }
+    return 0;
+  }
+
+  private sortByDamageAndFreshnessAgainst(
+    beasts: ScoredBeast[],
+    defender: Pick<ScoredBeast, "name" | "fullName">
+  ): ScoredBeast[] {
+    const defenderName = String(defender.name ?? "").toLowerCase().trim();
+    const defenderFull = String(defender.fullName ?? "").toLowerCase();
+    const nameMatchByToken = new Map<number, number>();
+    for (const beast of beasts) {
+      nameMatchByToken.set(
+        beast.token_id,
+        this.getNameMatchScoreFromNormalized(beast, defenderName, defenderFull)
+      );
+    }
+    return [...beasts].sort((a, b) => {
+      if (a.typeAdvantage !== b.typeAdvantage) return b.typeAdvantage - a.typeAdvantage;
+      if (a.score !== b.score) return b.score - a.score;
+      const aNameMatch = nameMatchByToken.get(a.token_id) ?? 0;
+      const bNameMatch = nameMatchByToken.get(b.token_id) ?? 0;
+      if (aNameMatch !== bNameMatch) return bNameMatch - aNameMatch;
+      const aPower = Number(a.basePower ?? 0);
+      const bPower = Number(b.basePower ?? 0);
+      if (aPower !== bPower) return bPower - aPower;
+      const aLuck = Number(a.luck ?? 0);
+      const bLuck = Number(b.luck ?? 0);
+      if (aLuck !== bLuck) return bLuck - aLuck;
+
+      // Keep tie-breaking deterministic while still rotating if same damage profile.
+      const aLast = this.beastLastSelectedAt.get(a.token_id) ?? 0;
+      const bLast = this.beastLastSelectedAt.get(b.token_id) ?? 0;
+      if (aLast !== bLast) return aLast - bLast;
+
+      return a.token_id - b.token_id;
+    });
+  }
+
+  private getNameMatchScoreFromNormalized(
+    attacker: Pick<ScoredBeast, "name" | "fullName">,
+    defenderName: string,
+    defenderFull: string
+  ): number {
+    const attackerName = String(attacker.name ?? "").toLowerCase().trim();
+    if (!attackerName || !defenderName) return 0;
+    if (attackerName === defenderName) return 2;
+
+    const attackerFull = String(attacker.fullName ?? "").toLowerCase();
+    if (attackerFull.includes(defenderName) || defenderFull.includes(attackerName)) {
+      return 1;
+    }
+    return 0;
+  }
+
+  private getOptimizedAttackPotionsPerBeast(input: {
+    summitHolder: NonNullable<GameSnapshot["summitHolder"]>;
+    primary: ScoredBeast | undefined;
+    isCaptureAttempt: boolean;
+    prioritizeDamage: boolean;
+    fallback: number;
+  }): number {
+    const base = Math.max(0, Math.floor(input.fallback));
+    if (base <= 0) return 0;
+    if (!this.config.strategy.dynamicAttackPotions) return base;
+
+    let multiplier = 1;
+    const holderPower = Math.max(0, Math.floor(input.summitHolder.basePower));
+
+    if (holderPower >= ATTACK_POTION_ELITE_HOLDER_POWER) {
+      multiplier += 0.45;
+    } else if (holderPower >= ATTACK_POTION_STRONG_HOLDER_POWER) {
+      multiplier += 0.2;
+    }
+
+    if ((input.primary?.typeAdvantage ?? 1) >= 1.5) {
+      multiplier += 0.15;
+    } else if ((input.primary?.typeAdvantage ?? 1) < 1) {
+      multiplier -= 0.1;
+    }
+
+    if (input.prioritizeDamage) multiplier += 0.1;
+    if (!input.isCaptureAttempt) multiplier = Math.max(0.7, multiplier - 0.2);
+
+    const optimized = Math.round(base * multiplier);
+    return Math.min(ATTACK_POTION_CAP, Math.max(1, optimized));
   }
 
   private selectDynamicAttackers(

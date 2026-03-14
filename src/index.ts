@@ -230,6 +230,8 @@ function isValidationResourceLimitError(message: string): boolean {
 
 const HARD_MAX_REVIVAL_POTIONS_PER_BEAST = 88;
 const HARD_MAX_EXTRA_LIFE_POTIONS_PER_ATTACK = 5;
+const HOLDER_CHANGED_BACKOFF_BASE_MS = 150;
+const HOLDER_CHANGED_BACKOFF_MAX_MS = 900;
 const ATTACK_POTION_ALLOWANCE_FALLBACK_MS = 30 * 60 * 1000;
 const EXTRA_LIFE_ALLOWANCE_FALLBACK_MS = 30 * 60 * 1000;
 const REVIVAL_ALLOWANCE_FALLBACK_MS = 10 * 60 * 1000;
@@ -2755,6 +2757,7 @@ async function executeAttackWithRetry(
 
       if (payloadForAttempt.useVrf === true) {
         let skipVrfWaitAfterSeed = false;
+        let vrfPrepWaitMs = VRF_SEED_WAIT_MS;
         const now = Date.now();
         if (now - lastVrfSeedRequestAt >= VRF_SEED_REQUEST_MIN_INTERVAL_MS) {
           try {
@@ -2773,6 +2776,7 @@ async function executeAttackWithRetry(
               return;
             }
             if (isValidationResourceLimitError(seedErrStr)) {
+              vrfPrepWaitMs = 350;
               consecutiveVrfSeedPreparationFailures += 1;
               if (consecutiveVrfSeedPreparationFailures >= 2) {
                 runtimeDisableVrfForAttacks = true;
@@ -2792,7 +2796,7 @@ async function executeAttackWithRetry(
           }
         }
         if (!skipVrfWaitAfterSeed) {
-          await sleep(VRF_SEED_WAIT_MS);
+          await sleep(vrfPrepWaitMs);
         }
       }
 
@@ -2874,6 +2878,7 @@ async function executeAttackWithRetry(
         matchStrLower.includes("vrfprovider") && matchStrLower.includes("not fulfilled");
       const missingVrfSeed = matchStrLower.includes("missing vrf seed");
       if (vrfNotFulfilled || missingVrfSeed) {
+        let vrfRecoveryWaitMs = VRF_SEED_WAIT_MS;
         const now = Date.now();
         if (now - lastVrfSeedRequestAt >= VRF_SEED_REQUEST_MIN_INTERVAL_MS) {
           try {
@@ -2892,6 +2897,7 @@ async function executeAttackWithRetry(
               return;
             }
             if (isValidationResourceLimitError(seedErrStr)) {
+              vrfRecoveryWaitMs = 350;
               consecutiveVrfSeedPreparationFailures += 1;
               if (consecutiveVrfSeedPreparationFailures >= 2 && vrfNotFulfilled) {
                 runtimeDisableVrfForAttacks = true;
@@ -2911,9 +2917,9 @@ async function executeAttackWithRetry(
           }
         }
         logger.warn(
-          `[L2V] ${vrfNotFulfilled ? "VRF not fulfilled" : "Missing VRF seed"} — waiting ${VRF_SEED_WAIT_MS}ms before retry`
+          `[L2V] ${vrfNotFulfilled ? "VRF not fulfilled" : "Missing VRF seed"} — waiting ${vrfRecoveryWaitMs}ms before retry`
         );
-        await sleep(VRF_SEED_WAIT_MS);
+        await sleep(vrfRecoveryWaitMs);
         continue;
       }
 
@@ -3019,9 +3025,12 @@ async function executeAttackWithRetry(
         // On a contested summit, the holder changes every ~0.5-1s. Instant
         // retries hit the same stale API data and fail again. After the first
         // failure, add an escalating backoff to let the chain settle and the
-        // API reflect the new holder. Caps at 3s.
+        // API reflect the new holder. Keep cap low for faster recapture races.
         if (consecutiveL1Failures > 1) {
-          const backoffMs = Math.min(3000, 500 * consecutiveL1Failures);
+          const backoffMs = Math.min(
+            HOLDER_CHANGED_BACKOFF_MAX_MS,
+            HOLDER_CHANGED_BACKOFF_BASE_MS * consecutiveL1Failures
+          );
           logger.info(
             `[L1] Summit holder changed (x${consecutiveL1Failures}) — backoff ${backoffMs}ms before refresh`
           );
